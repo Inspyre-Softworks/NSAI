@@ -638,6 +638,16 @@ Rules:
         draft_dispatch: bool = False,
         draft_factbook: bool = False,
     ) -> dict[str, Any]:
+        # Late import to avoid circular dependency (recommendations imports from governor)
+        from nsai.advisor.recommendations import (
+            collect_issue_option_ids,
+            DISMISS_OPTION_ID,
+            fallback_issue_choice,
+            fallback_recommendation,
+            validate_publication_drafts,
+            validate_recommendation,
+        )
+
         valid_issue_ids = [issue['issue_id'] for issue in live_issues]
         valid_option_ids = sorted({
             option['option_id']

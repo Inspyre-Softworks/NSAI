@@ -99,8 +99,8 @@ def test_windows_hello_verification_is_cached_per_process(monkeypatch) -> None:
     secure_store.require_windows_hello('Second reason')
     secure_store.require_windows_hello('Third reason')
 
-    # Only the first call should have triggered async work (availability + verification = 2).
-    assert call_count == 2, f'Expected 2 async calls, got {call_count}'
+    # Only the first call should have triggered async work (combined into 1).
+    assert call_count == 1, f'Expected 1 async call, got {call_count}'
 
     # Cleanup: reset so other tests are not affected.
     secure_store.reset_windows_hello_verification()

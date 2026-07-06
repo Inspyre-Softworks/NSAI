@@ -72,9 +72,11 @@ def windows_hello_timeout_seconds() -> float:
     return timeout
 
 
-async def _check_windows_hello_available() -> None:
+async def _windows_hello_verify(reason: str) -> None:
+    """Check availability then request verification in one apartment context."""
     try:
         from winrt.windows.security.credentials.ui import (
+            UserConsentVerificationResult,
             UserConsentVerifier,
             UserConsentVerifierAvailability,
         )
@@ -88,18 +90,6 @@ async def _check_windows_hello_available() -> None:
         raise SecureStoreError(
             'Windows Hello/user verification is not available for this Windows user.'
         )
-
-
-async def _request_windows_hello_verification(reason: str) -> None:
-    try:
-        from winrt.windows.security.credentials.ui import (
-            UserConsentVerificationResult,
-            UserConsentVerifier,
-        )
-    except ModuleNotFoundError as exc:
-        raise SecureStoreError(
-            'Windows Hello verification requires the Windows Runtime packages.'
-        ) from exc
 
     result = await UserConsentVerifier.request_verification_async(reason)
     if result != UserConsentVerificationResult.VERIFIED:
@@ -215,12 +205,10 @@ def require_windows_hello(reason: str) -> None:
         file=sys.stderr,
         flush=True,
     )
+    # Run availability check AND consent prompt in one thread/apartment so
+    # we never need to uninit and re-init the WinRT apartment between calls.
     run_windows_hello_async(
-        _check_windows_hello_available,
-        timeout_seconds=timeout,
-    )
-    run_windows_hello_async(
-        lambda: _request_windows_hello_verification(reason),
+        lambda: _windows_hello_verify(reason),
         timeout_seconds=timeout,
     )
     _windows_hello_verified = True

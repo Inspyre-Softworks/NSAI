@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import threading
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -93,14 +94,6 @@ async def _request_windows_hello_verification(reason: str) -> None:
         raise SecureStoreError(f'Windows Hello verification failed: {result!s}')
 
 
-async def _run_with_timeout(
-    coro: Awaitable[Any],
-    *,
-    timeout_seconds: float,
-) -> None:
-    await asyncio.wait_for(coro, timeout=timeout_seconds)
-
-
 def format_seconds(seconds: float) -> str:
     return f'{seconds:g}'
 
@@ -118,14 +111,73 @@ def run_windows_hello_async(
     try:
         asyncio.get_running_loop()
     except RuntimeError:
+        pass
+    else:
+        raise SecureStoreError(
+            'Windows Hello verification cannot run while another event loop is active.'
+        )
+
+    errors: list[BaseException] = []
+
+    def _run_on_thread() -> None:
+        # WinRT UI operations require a Single-Threaded Apartment (STA).
+        # Without init_apartment(STA) the consent dialog's dispatcher has no
+        # apartment context and the dialog silently never appears.
         try:
-            asyncio.run(
-                _run_with_timeout(
-                    coro_factory(),
-                    timeout_seconds=timeout,
-                )
+            from winrt._winrt import STA, init_apartment, uninit_apartment
+            init_apartment(STA)
+            winrt_initialized = True
+        except Exception:
+            winrt_initialized = False
+
+        # Bring the console window to the foreground so the system-level
+        # Windows Hello dialog has a visible anchor when it appears.
+        try:
+            import ctypes
+            hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+            if hwnd:
+                ctypes.windll.user32.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
+
+        # Use ProactorEventLoop (native Windows IOCP) and register it as the
+        # running loop for this thread so winrt can schedule completion
+        # callbacks back via call_soon_threadsafe.
+        loop = asyncio.ProactorEventLoop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(
+                asyncio.wait_for(coro_factory(), timeout=timeout)
             )
-        except TimeoutError as exc:
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            try:
+                loop.close()
+            except Exception:
+                pass
+            asyncio.set_event_loop(None)
+            if winrt_initialized:
+                try:
+                    uninit_apartment()
+                except Exception:
+                    pass
+
+    thread = threading.Thread(target=_run_on_thread, daemon=True)
+    thread.start()
+    thread.join(timeout + 5.0)
+
+    if thread.is_alive():
+        raise SecureStoreError(
+            'Windows Hello verification timed out waiting for the consent dialog. '
+            'Try again from an interactive Windows session, provide the secret '
+            'through the environment for this run, or re-save the secret with '
+            '--secret-backend keyring.'
+        )
+
+    if errors:
+        exc = errors[0]
+        if isinstance(exc, TimeoutError):
             raise SecureStoreError(
                 'Windows Hello verification did not complete after '
                 f'{format_seconds(timeout)} seconds. Try again from an '
@@ -133,11 +185,7 @@ def run_windows_hello_async(
                 'environment for this run, or re-save the secret with '
                 '--secret-backend keyring.'
             ) from exc
-        return
-
-    raise SecureStoreError(
-        'Windows Hello verification cannot run while another event loop is active.'
-    )
+        raise exc
 
 
 def require_windows_hello(reason: str) -> None:

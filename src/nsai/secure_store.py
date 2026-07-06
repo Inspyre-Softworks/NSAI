@@ -25,6 +25,18 @@ class SecureStoreError(RuntimeError):
     """Raised when the OS credential store cannot save or load a secret."""
 
 
+# Process-level Windows Hello verification cache.  Once the user has proven
+# identity in the current process we trust them for the remainder of that
+# process rather than prompting on every secret access.
+_windows_hello_verified: bool = False
+
+
+def reset_windows_hello_verification() -> None:
+    """Clear the process-level verification cache (useful for testing)."""
+    global _windows_hello_verified
+    _windows_hello_verified = False
+
+
 def default_secret_backend() -> str:
     if os.name == 'nt':
         return SECRET_BACKEND_WINDOWS_HELLO
@@ -189,8 +201,13 @@ def run_windows_hello_async(
 
 
 def require_windows_hello(reason: str) -> None:
+    global _windows_hello_verified
+
     if os.name != 'nt':
         raise SecureStoreError('Windows Hello secrets are only supported on Windows.')
+
+    if _windows_hello_verified:
+        return
 
     timeout = windows_hello_timeout_seconds()
     print(
@@ -206,6 +223,7 @@ def require_windows_hello(reason: str) -> None:
         lambda: _request_windows_hello_verification(reason),
         timeout_seconds=timeout,
     )
+    _windows_hello_verified = True
 
 
 def set_secret(

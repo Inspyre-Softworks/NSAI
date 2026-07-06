@@ -78,3 +78,29 @@ def test_windows_hello_async_timeout_becomes_store_error(monkeypatch) -> None:
 
     with pytest.raises(secure_store.SecureStoreError, match='did not complete'):
         secure_store.run_windows_hello_async(never_finishes)
+
+
+def test_windows_hello_verification_is_cached_per_process(monkeypatch) -> None:
+    """Once verified, subsequent require_windows_hello calls are no-ops."""
+    import os
+    if os.name != 'nt':
+        pytest.skip('Windows-only test')
+
+    call_count = 0
+
+    def _fake_run_async(coro_factory, *, timeout_seconds=None):
+        nonlocal call_count
+        call_count += 1
+
+    secure_store.reset_windows_hello_verification()
+    monkeypatch.setattr(secure_store, 'run_windows_hello_async', _fake_run_async)
+
+    secure_store.require_windows_hello('First reason')
+    secure_store.require_windows_hello('Second reason')
+    secure_store.require_windows_hello('Third reason')
+
+    # Only the first call should have triggered async work (availability + verification = 2).
+    assert call_count == 2, f'Expected 2 async calls, got {call_count}'
+
+    # Cleanup: reset so other tests are not affected.
+    secure_store.reset_windows_hello_verification()

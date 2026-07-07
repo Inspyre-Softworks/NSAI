@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+from io import BytesIO
 from types import SimpleNamespace
 import xml.etree.ElementTree as ET
 
 import pytest
+from PIL import Image
 from rich.console import Console
 
 import nsai.advisor.live as live
@@ -266,6 +268,7 @@ def test_ai_prompt_context_is_compact_and_clear() -> None:
     assert len(summary['red_lines']) == live.PROMPT_LIST_LIMIT
     assert len(summary['vision_description']) <= live.PROMPT_LONG_TEXT_LIMIT
     assert 'Never describe dismissing an issue "with Option N"' in instruction
+    assert 'charter_alignment_score is required' in instruction
     assert nation_context['fullname'] == 'Oringrad'
     assert 'unused' not in nation_context
     assert len(nation_context['legislation']) <= live.PROMPT_LONG_TEXT_LIMIT
@@ -274,18 +277,58 @@ def test_ai_prompt_context_is_compact_and_clear() -> None:
     assert len(issues[0]['text']) <= live.PROMPT_LONG_TEXT_LIMIT
 
 
+def test_render_ascii_flag_from_png(monkeypatch) -> None:
+    image = Image.new('RGB', (2, 2))
+    image.putdata([
+        (0, 0, 0),
+        (255, 255, 255),
+        (255, 255, 255),
+        (0, 0, 0),
+    ])
+    buffer = BytesIO()
+    image.save(buffer, format='PNG')
+
+    class FakeResponse:
+        def __init__(self, content: bytes) -> None:
+            self.content = content
+
+        def raise_for_status(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        live.requests,
+        'get',
+        lambda url, timeout=15: FakeResponse(buffer.getvalue()),
+    )
+
+    ascii_flag = live.render_ascii_flag('https://example.com/flag.png', width=8)
+    lines = ascii_flag.splitlines()
+
+    assert len(lines) == 4
+    assert all(len(line) == 8 for line in lines)
+
+
+def test_render_banner_includes_nation_name() -> None:
+    banner = live.render_banner('Oringrad')
+
+    assert 'Oringrad' in banner
+    assert banner.count('=') >= 40
+
+
 def test_advise_skips_ai_issue_selection_when_only_one_issue(
     tmp_path,
     monkeypatch,
     capsys,
 ) -> None:
     monkeypatch.setenv('NSAI_CONFIG_HOME', str(tmp_path / 'config-home'))
+    shards_seen: list[list[str]] = []
 
     class FakeNationStatesClient:
         user_agent = 'NSAI-Test/0.1 contact:test@example.com nation:Oringrad'
         api_version = None
 
         def public_nation(self, nation, shards):
+            shards_seen.append(list(shards))
             return ET.fromstring('<NATION id="oringrad"><FULLNAME>Oringrad</FULLNAME></NATION>')
 
         def issues(self, nation):
@@ -358,6 +401,93 @@ def test_advise_skips_ai_issue_selection_when_only_one_issue(
     output = capsys.readouterr().out
     assert 'AI step skipped: only one live issue is present.' in output
     assert FakeGovernor.advise_called is True
+    assert 'flag' in shards_seen[0]
+
+
+def test_advise_skips_flag_shard_when_flag_display_none(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.setenv('NSAI_CONFIG_HOME', str(tmp_path / 'config-home'))
+    shards_seen: list[list[str]] = []
+
+    class FakeNationStatesClient:
+        user_agent = 'NSAI-Test/0.1 contact:test@example.com nation:Oringrad'
+        api_version = None
+
+        def public_nation(self, nation, shards):
+            shards_seen.append(list(shards))
+            return ET.fromstring('<NATION id="oringrad"><FULLNAME>Oringrad</FULLNAME></NATION>')
+
+        def issues(self, nation):
+            return ET.fromstring(
+                '''
+                <NATION>
+                  <ISSUES>
+                    <ISSUE id="123">
+                      <TITLE>Robot Teachers</TITLE>
+                      <TEXT>Schools want robot teachers.</TEXT>
+                      <OPTION id="1">Ban them.</OPTION>
+                      <OPTION id="2">Regulate them.</OPTION>
+                    </ISSUE>
+                  </ISSUES>
+                </NATION>
+                '''
+            )
+
+    class FakeGovernor:
+        def __init__(self, *, base_url=None, model=None, api_key=None):
+            self.base_url = base_url or 'http://localhost:1234/v1'
+            self.model = model or 'test-model'
+
+        def select_issue(self, **kwargs):
+            raise AssertionError('select_issue should not be called for one live issue')
+
+        def advise(self, *, live_issues, **kwargs):
+            return {
+                **sample_recommendation(),
+                'issue_id': '123',
+                'option_id': '2',
+                'model': self.model,
+            }
+
+    monkeypatch.setattr(
+        live.NationStatesClient,
+        'from_env',
+        classmethod(lambda cls, nation_config=None: FakeNationStatesClient()),
+    )
+    monkeypatch.setattr(live, 'LocalGovernor', FakeGovernor)
+
+    args = SimpleNamespace(
+        save_opts=False,
+        profile=None,
+        nation='Oringrad',
+        no_nation_config=True,
+        strategy=None,
+        show_issues=False,
+        show_instruction=False,
+        no_ai=False,
+        audit_log=str(tmp_path / 'audit.jsonl'),
+        base_url='http://localhost:1234/v1',
+        model='test-model',
+        lm_api_key=None,
+        secret_backend=None,
+        draft_dispatch=False,
+        draft_factbook=False,
+        refresh_advice=True,
+        enact=False,
+        auto=False,
+        override_red_line=False,
+        flag_display='none',
+    )
+
+    run_advise(args)
+
+    assert shards_seen, 'public_nation should have been called'
+    assert 'flag' not in shards_seen[0], (
+        "flag shard should not be requested when flag_display='none'"
+    )
 
 
 def test_model_reload_issue_selection_retry_blocks_auto_action(
@@ -551,6 +681,26 @@ def test_suspicious_confidence_alignment_fails_validation() -> None:
     assert any('suspiciously high' in reason for reason in result.reasons)
 
 
+def test_neutral_alignment_at_auto_threshold_passes_validation() -> None:
+    recommendation = {
+        **sample_recommendation(),
+        'action': 'enact',
+        'option_id': '2',
+        'confidence': 0.90,
+        'alignment_score': 0,
+        'charter_alignment_score': 0,
+    }
+
+    result = validate_recommendation_consistency(
+        recommendation,
+        live_issues=sample_issues(),
+        selected_issue=sample_issues()[0],
+    )
+
+    assert result.passed is True
+    assert not any('suspiciously high' in reason for reason in result.reasons)
+
+
 def test_auto_validation_passes_for_valid_enact() -> None:
     result = validate_auto_action(
         live_issues=sample_issues(),
@@ -572,6 +722,32 @@ def test_auto_validation_passes_for_valid_enact() -> None:
 
     assert result.passed is True
     assert result.reasons == []
+
+
+def test_auto_validation_blocks_zero_alignment_enact() -> None:
+    result = validate_auto_action(
+        live_issues=sample_issues(),
+        selected_issue=sample_issues()[0],
+        recommendation={
+            **sample_recommendation(),
+            'action': 'enact',
+            'option_id': '2',
+            'confidence': 0.90,
+            'alignment_score': 0,
+            'charter_alignment_score': 0,
+            'red_line_triggered': False,
+        },
+        ai_step_statuses=[
+            {'step': 'issue_selection', 'status': 'ok'},
+            {'step': 'recommendation_generation', 'status': 'ok'},
+        ],
+        draft_dispatch=False,
+        draft_factbook=False,
+        minimum_confidence=0.8,
+    )
+
+    assert result.passed is False
+    assert any('positive alignment score' in reason for reason in result.reasons)
 
 
 def test_valid_auto_enact_calls_action_endpoint(
@@ -981,6 +1157,36 @@ def test_publication_category_resolution() -> None:
         kind='factbook',
     )
     assert (factbook_category, factbook_subcategory) == (1, 108)
+
+
+def test_build_default_user_agent() -> None:
+    agent = live.build_default_user_agent('Oringrad')
+    assert 'NSAI/' in agent
+    assert 'nation:Oringrad' in agent
+
+
+def test_build_default_user_agent_sanitizes_special_chars() -> None:
+    agent = live.build_default_user_agent('New Oringrad!')
+    nation_part = agent.split('nation:')[1]
+    assert ' ' not in nation_part
+    assert '!' not in nation_part
+
+
+def test_from_env_auto_builds_user_agent_when_missing(monkeypatch) -> None:
+    from nsai.nations import NationConfig
+    monkeypatch.delenv('NS_USER_AGENT', raising=False)
+    config = NationConfig(nation_name='Oringrad')
+    config.user_agent = None
+    client = NationStatesClient.from_env(config)
+    assert 'NSAI/' in client.user_agent
+    assert 'Oringrad' in client.user_agent
+
+
+def test_from_env_uses_explicit_env_agent_when_set(monkeypatch) -> None:
+    monkeypatch.setenv('NS_USER_AGENT', 'CustomAgent/1.0 contact:me nation:Oringrad')
+    config = None
+    client = NationStatesClient.from_env(config)
+    assert client.user_agent == 'CustomAgent/1.0 contact:me nation:Oringrad'
 
 
 def test_private_command_prepare_execute_flow() -> None:

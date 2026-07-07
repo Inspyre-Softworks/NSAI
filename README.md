@@ -187,6 +187,8 @@ poetry run nsai advise --profile .\oringrad_governance_profile.json --auto
 
 `--auto` is not an override switch. It only allows automatic action when a loaded profile has `enactment_mode` set to `auto_enact_high_confidence`, `auto_enact_unless_red_line`, or `fully_autonomous`; the recommendation is not a fallback; no red line is triggered; and the confidence meets the profile's `minimum_confidence_to_enact`. With `auto_enact_high_confidence`, confidence must also be at least `0.85`. If cached advice is stale or too conservative, use `--refresh-advice` to ask the model again.
 
+`--flag-display ascii` renders the nation's flag image as ASCII art after NSAI loads the NationStates nation. Use `--flag-display banner` for a simple text banner instead.
+
 ## Environment Variables
 
 NationStates requires an informative User-Agent. In PowerShell:

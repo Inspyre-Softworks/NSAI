@@ -118,7 +118,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> None:
+def _run(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
     if not hasattr(args, 'save_opts'):
@@ -167,12 +167,18 @@ def main(argv: list[str] | None = None) -> None:
     args.func(args)
 
 
-if __name__ == '__main__':
+def main(argv: list[str] | None = None) -> int:
     try:
-        main()
+        _run(argv)
     except KeyboardInterrupt:
-        print('\nCancelled.')
-        sys.exit(130)
+        print('\nCancelled.', file=sys.stderr)
+        return 130
     except Exception as exc:
-        print(f'\nERROR: {exc}')
-        sys.exit(1)
+        print(f'\nERROR: {exc}', file=sys.stderr)
+        return 1
+
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

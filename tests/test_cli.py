@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+import nsai.nations as nations
 from nsai import __version__
 from nsai.cli import build_parser, main
 
@@ -133,8 +134,22 @@ def test_profile_interview_accepts_textual_dev_flag() -> None:
 
 
 def test_cli_without_command_prints_help(capsys) -> None:
-    main([])
+    assert main([]) == 0
 
     output = capsys.readouterr().out
     assert 'NationStates AI profile builder' in output
     assert 'advise' in output
+
+
+def test_main_reports_action_errors_without_traceback(monkeypatch, capsys) -> None:
+    def _raise_error(args) -> None:
+        raise RuntimeError('verification failed')
+
+    monkeypatch.setattr(nations, 'run_nation_set', _raise_error)
+
+    assert main(['nation', 'set', 'Oringrad']) == 1
+
+    captured = capsys.readouterr()
+    assert 'ERROR: verification failed' in captured.err
+    assert 'Traceback' not in captured.out
+    assert 'Traceback' not in captured.err

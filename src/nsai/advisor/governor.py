@@ -471,13 +471,16 @@ class LocalGovernor:
         self,
         *,
         step_name: str,
-        pulse_label: str,
+        pulse_label: str | None,
         **kwargs: Any,
     ) -> Any:
         for attempt in range(1, LOCAL_MODEL_RELOAD_MAX_ATTEMPTS + 1):
             try:
-                with StatusPulse(pulse_label):
-                    return self.client.chat.completions.create(**kwargs)
+                if pulse_label:
+                    with StatusPulse(pulse_label):
+                        return self.client.chat.completions.create(**kwargs)
+
+                return self.client.chat.completions.create(**kwargs)
             except Exception as exc:
                 if is_model_reload_error(exc) and attempt < LOCAL_MODEL_RELOAD_MAX_ATTEMPTS:
                     print(
@@ -799,6 +802,7 @@ Rules:
         profile: dict[str, Any] | None = None,
         draft_dispatch: bool = False,
         draft_factbook: bool = False,
+        pulse_label: str | None = 'AI step: generating recommendation for selected issue',
     ) -> dict[str, Any]:
         # Late import to avoid circular dependency (recommendations imports from governor)
         from nsai.advisor.recommendations import (
@@ -1043,7 +1047,7 @@ Rules:
         try:
             response = self._chat_completion_with_reload_retry(
                 step_name='recommendation generation',
-                pulse_label='AI step: generating recommendation for selected issue',
+                pulse_label=pulse_label,
                 model=self.model,
                 messages=messages,
                 temperature=0.25,
@@ -1081,7 +1085,11 @@ Rules:
             try:
                 response = self._chat_completion_with_reload_retry(
                     step_name='recommendation text-mode retry',
-                    pulse_label='AI step: retrying recommendation in text mode',
+                    pulse_label=(
+                        'AI step: retrying recommendation in text mode'
+                        if pulse_label
+                        else None
+                    ),
                     model=self.model,
                     messages=messages,
                     temperature=0.25,

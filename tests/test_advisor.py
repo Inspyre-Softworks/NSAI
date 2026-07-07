@@ -1132,6 +1132,7 @@ def test_all_issues_parallel_requests_prefetch_missing_advice(
     class FakeGovernor:
         plan_calls = 0
         advise_issue_ids: list[str] = []
+        advise_pulse_labels: list[str | None] = []
 
         def __init__(self, *, base_url=None, model=None, api_key=None):
             self.base_url = base_url or 'http://localhost:1234/v1'
@@ -1152,6 +1153,7 @@ def test_all_issues_parallel_requests_prefetch_missing_advice(
             issue = live_issues[0]
             issue_id = str(issue['issue_id'])
             FakeGovernor.advise_issue_ids.append(issue_id)
+            FakeGovernor.advise_pulse_labels.append(kwargs.get('pulse_label'))
             return {
                 **sample_recommendation(),
                 'issue_id': issue_id,
@@ -1179,8 +1181,116 @@ def test_all_issues_parallel_requests_prefetch_missing_advice(
 
     assert FakeGovernor.plan_calls == 1
     assert sorted(FakeGovernor.advise_issue_ids) == ['123', '456']
+    assert FakeGovernor.advise_pulse_labels == [None, None]
     assert output.count('AI step skipped: reused cached recommendation.') == 2
-    assert 'Prefetching advice for 2 issue(s) with 2 parallel request(s).' in output
+    assert 'Prefetching missing advice: 2/2 issue(s), 2 worker(s)' in output
+
+
+def test_all_issues_parallel_prefetch_reports_cached_advice(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.setenv('NSAI_CONFIG_HOME', str(tmp_path / 'config-home'))
+    profile_path = write_auto_profile(tmp_path)
+    cached_issue = {
+        'issue_id': '123',
+        'title': 'Robot Teachers',
+        'text': 'Schools want robot teachers.',
+        'options': [{'option_id': '1', 'text': 'Regulate them.'}],
+    }
+    live.AdviceCache().save_advice(
+        nation='Oringrad',
+        live_issue=cached_issue,
+        recommendation={
+            **sample_recommendation(),
+            'issue_id': '123',
+            'option_id': '1',
+            'headline': 'Handle cached issue',
+            'model': 'test-model',
+        },
+        source='ai',
+    )
+
+    class FakeNationStatesClient:
+        user_agent = 'NSAI-Test/0.1 contact:test@example.com nation:Oringrad'
+        api_version = None
+
+        def public_nation(self, nation, shards):
+            return ET.fromstring('<NATION id="oringrad"><FULLNAME>Oringrad</FULLNAME></NATION>')
+
+        def issues(self, nation):
+            return ET.fromstring(
+                '''
+                <NATION>
+                  <ISSUES>
+                    <ISSUE id="123">
+                      <TITLE>Robot Teachers</TITLE>
+                      <TEXT>Schools want robot teachers.</TEXT>
+                      <OPTION id="1">Regulate them.</OPTION>
+                    </ISSUE>
+                    <ISSUE id="456">
+                      <TITLE>Orbital Farms</TITLE>
+                      <TEXT>Farmers want orbital hydroponics grants.</TEXT>
+                      <OPTION id="1">Fund them.</OPTION>
+                    </ISSUE>
+                  </ISSUES>
+                </NATION>
+                '''
+            )
+
+    class FakeGovernor:
+        advise_issue_ids: list[str] = []
+        advise_pulse_labels: list[str | None] = []
+
+        def __init__(self, *, base_url=None, model=None, api_key=None):
+            self.base_url = base_url or 'http://localhost:1234/v1'
+            self.model = model or 'test-model'
+
+        def plan_issue_order(self, **kwargs):
+            return {
+                'ordered_issue_ids': ['456', '123'],
+                'reasons': {
+                    '456': 'Food security is most urgent.',
+                    '123': 'Education policy can follow.',
+                },
+                'model': self.model,
+            }
+
+        def advise(self, *, live_issues, **kwargs):
+            issue = live_issues[0]
+            issue_id = str(issue['issue_id'])
+            FakeGovernor.advise_issue_ids.append(issue_id)
+            FakeGovernor.advise_pulse_labels.append(kwargs.get('pulse_label'))
+            return {
+                **sample_recommendation(),
+                'issue_id': issue_id,
+                'option_id': str(issue['options'][0]['option_id']),
+                'headline': f'Handle issue {issue_id}',
+                'model': self.model,
+            }
+
+    monkeypatch.setattr(
+        live.NationStatesClient,
+        'from_env',
+        classmethod(lambda cls, nation_config=None: FakeNationStatesClient()),
+    )
+    monkeypatch.setattr(live, 'LocalGovernor', FakeGovernor)
+
+    args = advise_args(tmp_path, profile_path=profile_path)
+    args.all_issues = True
+    args.auto = False
+    args.refresh_advice = False
+    args.flag_display = 'none'
+    args.parallel_requests = 2
+
+    run_advise(args)
+    output = capsys.readouterr().out
+
+    assert FakeGovernor.advise_issue_ids == ['456']
+    assert FakeGovernor.advise_pulse_labels == [None]
+    assert 'Prefetching missing advice: 1/2 issue(s), 1 worker(s)' in output
+    assert '1 cached, requested 2' in output
 
 
 def test_all_issues_progress_uses_stable_timer_layout() -> None:

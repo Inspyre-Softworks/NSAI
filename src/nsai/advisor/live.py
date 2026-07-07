@@ -478,19 +478,28 @@ def prefetch_issue_advice(
     ):
         return
 
+    cached_issue_ids = {
+        str(issue_id)
+        for issue_id in ordered_issue_ids
+        if cache.get_advice(nation, issue_id) is not None
+    }
     issues_to_prefetch = [
         live_issue_by_id(live_issues, issue_id)
         for issue_id in ordered_issue_ids
-        if cache.get_advice(nation, issue_id) is None
+        if str(issue_id) not in cached_issue_ids
     ]
     issues_to_prefetch = [issue for issue in issues_to_prefetch if issue is not None]
     if not issues_to_prefetch:
+        console.print(
+            'Parallel advice prefetch skipped: all planned issue advice is already cached.'
+        )
         return
 
     worker_count = min(parallel_requests, len(issues_to_prefetch))
     console.print(
-        f'Prefetching advice for {len(issues_to_prefetch)} issue(s) '
-        f'with {worker_count} parallel request(s).'
+        f'Prefetching missing advice: {len(issues_to_prefetch)}/'
+        f'{len(ordered_issue_ids)} issue(s), {worker_count} worker(s), '
+        f'{len(cached_issue_ids)} cached, requested {parallel_requests}.'
     )
 
     def request_advice(issue: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -506,6 +515,7 @@ def prefetch_issue_advice(
             profile=profile,
             draft_dispatch=draft_dispatch,
             draft_factbook=draft_factbook,
+            pulse_label=None,
         )
         issue_id = str(issue.get('issue_id', ''))
         if str(recommendation.get('issue_id', '')) != issue_id:

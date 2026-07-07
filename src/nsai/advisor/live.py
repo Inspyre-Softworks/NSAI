@@ -79,7 +79,7 @@ LOCAL_MODEL_RELOAD_MAX_ATTEMPTS = 2
 PROMPT_TEXT_LIMIT = 900
 PROMPT_LONG_TEXT_LIMIT = 1800
 PROMPT_LIST_LIMIT = 8
-FLAG_DISPLAY_MODES = {'ascii', 'banner'}
+FLAG_DISPLAY_MODES = {'ascii', 'banner', 'none'}
 FLAG_ASCII_WIDTH = 42
 FLAG_ASCII_RAMP = '@%#*+=-:. '
 DISPATCH_CATEGORY_IDS = {
@@ -179,10 +179,12 @@ def build_default_user_agent(nation: str) -> str:
 
     Used as an automatic fallback when neither NS_USER_AGENT nor a saved
     per-nation user_agent is available.  The format follows NationStates
-    API etiquette (tool/version contact:script nation:name).
+    API etiquette (tool/version nation:name).  No contact field is included
+    because a placeholder contact is no better than none; callers should
+    set NS_USER_AGENT with a real contact address.
     """
     safe_nation = re.sub(r'[^a-zA-Z0-9_-]', '_', nation.strip()) or 'unknown'
-    return f'NSAI/{_NSAI_VERSION} contact:script nation:{safe_nation}'
+    return f'NSAI/{_NSAI_VERSION} nation:{safe_nation}'
 
 
 class NationStatesClient:
@@ -222,9 +224,15 @@ class NationStatesClient:
             nation_name = nation_config.nation_name if nation_config else 'unknown'
             user_agent = build_default_user_agent(nation_name)
             print(
-                f'NS_USER_AGENT not set; using auto-generated agent: {user_agent}\n'
-                'Set NS_USER_AGENT or run `nsai nation set <nation> --user-agent ...` '
-                'to use a custom agent.'
+                (
+                    'WARNING: NS_USER_AGENT not set; using auto-generated placeholder '
+                    f'agent: {user_agent}\n'
+                    'For proper API etiquette, set NS_USER_AGENT to a User-Agent with a '
+                    'real contact address, or run '
+                    '`nsai nation set <nation> --user-agent ...` to configure a custom '
+                    'agent.\n'
+                ),
+                file=sys.stderr,
             )
 
         version_raw = os.environ.get('NS_API_VERSION')
@@ -1258,6 +1266,9 @@ def render_banner(name: str) -> str:
 
 
 def print_nation_flag(nation_root: ET.Element, *, flag_display: str = 'ascii') -> None:
+    if flag_display == 'none':
+        return
+
     nation_name = (nation_root.findtext('FULLNAME') or nation_root.get('id') or 'Unknown nation').strip()
     flag_url = nation_flag_url(nation_root)
 
@@ -3202,10 +3213,11 @@ def run_advise(args: argparse.Namespace) -> None:
             profile_path = saved_profile_path
         nation_config = maybe_load_nation_config(nation)
 
+    flag_display = str(getattr(args, 'flag_display', 'ascii'))
+
     with StatusPulse('NationStates: loading public nation data'):
-        nation_root = ns.public_nation(nation, [
+        public_shards = [
             'fullname',
-            'flag',
             'motto',
             'category',
             'region',
@@ -3217,11 +3229,14 @@ def run_advise(args: argparse.Namespace) -> None:
             'govtdesc',
             'policies',
             'legislation',
-        ])
+        ]
+        if flag_display != 'none':
+            public_shards.insert(1, 'flag')
+        nation_root = ns.public_nation(nation, public_shards)
 
     print_nation_flag(
         nation_root,
-        flag_display=str(getattr(args, 'flag_display', 'ascii')),
+        flag_display=flag_display,
     )
 
     with StatusPulse('NationStates: loading live issues'):

@@ -29,12 +29,14 @@ class SecureStoreError(RuntimeError):
 # identity in the current process we trust them for the remainder of that
 # process rather than prompting on every secret access.
 _windows_hello_verified: bool = False
+_windows_hello_lock = threading.Lock()
 
 
 def reset_windows_hello_verification() -> None:
     """Clear the process-level verification cache (useful for testing)."""
     global _windows_hello_verified
-    _windows_hello_verified = False
+    with _windows_hello_lock:
+        _windows_hello_verified = False
 
 
 def default_secret_backend() -> str:
@@ -142,22 +144,26 @@ def run_windows_hello_async(
         except Exception:
             pass
 
-        # Use ProactorEventLoop (native Windows IOCP) and register it as the
-        # running loop for this thread so winrt can schedule completion
-        # callbacks back via call_soon_threadsafe.
-        loop = asyncio.ProactorEventLoop()
-        asyncio.set_event_loop(loop)
+        # Create and register an event loop for this thread.  Using
+        # new_event_loop() instead of ProactorEventLoop() directly keeps the
+        # helper portable (on Windows the default policy still returns a
+        # ProactorEventLoop) and avoids the deprecation warning for direct
+        # ProactorEventLoop instantiation.
+        loop = None
         try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
             loop.run_until_complete(
                 asyncio.wait_for(coro_factory(), timeout=timeout)
             )
         except Exception as exc:
             errors.append(exc)
         finally:
-            try:
-                loop.close()
-            except Exception:
-                pass
+            if loop is not None:
+                try:
+                    loop.close()
+                except Exception:
+                    pass
             asyncio.set_event_loop(None)
             if winrt_initialized:
                 try:
@@ -199,19 +205,25 @@ def require_windows_hello(reason: str) -> None:
     if _windows_hello_verified:
         return
 
-    timeout = windows_hello_timeout_seconds()
-    print(
-        f'Windows Hello verification required: {reason}',
-        file=sys.stderr,
-        flush=True,
-    )
-    # Run availability check AND consent prompt in one thread/apartment so
-    # we never need to uninit and re-init the WinRT apartment between calls.
-    run_windows_hello_async(
-        lambda: _windows_hello_verify(reason),
-        timeout_seconds=timeout,
-    )
-    _windows_hello_verified = True
+    with _windows_hello_lock:
+        # Double-check inside the lock so that if two threads race through the
+        # first guard above, only one actually runs verification.
+        if _windows_hello_verified:
+            return
+
+        timeout = windows_hello_timeout_seconds()
+        print(
+            f'Windows Hello verification required: {reason}',
+            file=sys.stderr,
+            flush=True,
+        )
+        # Run availability check AND consent prompt in one thread/apartment so
+        # we never need to uninit and re-init the WinRT apartment between calls.
+        run_windows_hello_async(
+            lambda: _windows_hello_verify(reason),
+            timeout_seconds=timeout,
+        )
+        _windows_hello_verified = True
 
 
 def set_secret(

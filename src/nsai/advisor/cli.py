@@ -804,6 +804,17 @@ def add_advise_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
     parser.add_argument(
+        '--parallel-requests',
+        type=int,
+        default=1,
+        metavar='N',
+        help=(
+            'For --all-issues, prefetch missing local-model recommendations '
+            'with up to N parallel requests before applying issue actions in order.'
+        ),
+    )
+
+    parser.add_argument(
         '--decision-summary',
         action=argparse.BooleanOptionalAction,
         default=True,

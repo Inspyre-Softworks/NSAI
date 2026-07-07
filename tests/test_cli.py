@@ -83,6 +83,7 @@ def test_cli_subcommand_help_surfaces_shapes(capsys) -> None:
     assert '--no-nation-config' in advise_output
     assert '--refresh-advice' in advise_output
     assert '--all-issues' in advise_output
+    assert '--parallel-requests' in advise_output
     assert '--decision-summary' in advise_output
 
     with pytest.raises(SystemExit) as exc:

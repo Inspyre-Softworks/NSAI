@@ -276,6 +276,36 @@ class AdviceCache:
         if row is None:
             return None
 
+        return self._cached_issue_plan_from_row(row)
+
+    def get_covering_issue_plan(
+        self,
+        nation: str,
+        live_issues: list[dict[str, Any]],
+    ) -> CachedIssuePlan | None:
+        issue_ids = set(issue_ids_for(live_issues))
+        if not issue_ids:
+            return None
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                '''
+                SELECT *
+                FROM issue_plans
+                WHERE nation = ?
+                ORDER BY updated_at DESC
+                ''',
+                (nation,),
+            ).fetchall()
+
+        for row in rows:
+            cached_issue_ids = set(json.loads(str(row['issue_ids_json'])))
+            if issue_ids.issubset(cached_issue_ids):
+                return self._cached_issue_plan_from_row(row)
+
+        return None
+
+    def _cached_issue_plan_from_row(self, row: sqlite3.Row) -> CachedIssuePlan:
         return CachedIssuePlan(
             nation=str(row['nation']),
             issue_signature=str(row['issue_signature']),

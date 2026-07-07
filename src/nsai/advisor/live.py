@@ -18,6 +18,7 @@ import os
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -369,6 +370,28 @@ def get_or_create_issue_order_plan(
                     'from_cache': True,
                     'fallback_issue_order_used': cached_plan.source == 'fallback',
                 }
+        cached_covering_plan = cache.get_covering_issue_plan(nation, live_issues)
+        if cached_covering_plan:
+            ordered_issue_ids, reasons = normalize_issue_order_plan(
+                {
+                    'ordered_issue_ids': cached_covering_plan.ordered_issue_ids,
+                    'reasons': cached_covering_plan.reasons,
+                },
+                live_issues,
+            )
+            print(
+                'AI step skipped: reused cached all-issues order plan '
+                'for remaining live issues.'
+            )
+            return {
+                'ordered_issue_ids': ordered_issue_ids,
+                'reasons': reasons,
+                'source': cached_covering_plan.source or 'cache',
+                'token_usage': cached_covering_plan.token_usage,
+                'from_cache': True,
+                'from_covering_cache': True,
+                'fallback_issue_order_used': cached_covering_plan.source == 'fallback',
+            }
 
     if len(live_issues) == 1 or getattr(args, 'no_ai', False):
         plan = fallback_issue_order(live_issues, strategy)
@@ -426,6 +449,109 @@ def clone_args_for_issue(
     return child_args
 
 
+def prefetch_issue_advice(
+    *,
+    args: argparse.Namespace,
+    nation: str,
+    ordered_issue_ids: list[str],
+    live_issues: list[dict[str, Any]],
+    cache: AdviceCache,
+    strategy: str,
+    profile: dict[str, Any] | None,
+    nation_snapshot_xml: str,
+    lm_base_url: str,
+    lm_model: str | None,
+    lm_api_key: str,
+    draft_dispatch: bool,
+    draft_factbook: bool,
+    valid_options: dict[str, set[str]],
+    console: Console,
+) -> None:
+    parallel_requests = max(
+        1,
+        int(getattr(args, 'parallel_requests', 1) or 1),
+    )
+    if (
+        parallel_requests <= 1
+        or getattr(args, 'no_ai', False)
+        or getattr(args, 'refresh_advice', False)
+    ):
+        return
+
+    issues_to_prefetch = [
+        live_issue_by_id(live_issues, issue_id)
+        for issue_id in ordered_issue_ids
+        if cache.get_advice(nation, issue_id) is None
+    ]
+    issues_to_prefetch = [issue for issue in issues_to_prefetch if issue is not None]
+    if not issues_to_prefetch:
+        return
+
+    worker_count = min(parallel_requests, len(issues_to_prefetch))
+    console.print(
+        f'Prefetching advice for {len(issues_to_prefetch)} issue(s) '
+        f'with {worker_count} parallel request(s).'
+    )
+
+    def request_advice(issue: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+        governor = LocalGovernor(
+            base_url=lm_base_url,
+            model=lm_model,
+            api_key=lm_api_key,
+        )
+        recommendation = governor.advise(
+            nation_snapshot_xml=nation_snapshot_xml,
+            live_issues=[issue],
+            strategy=strategy,
+            profile=profile,
+            draft_dispatch=draft_dispatch,
+            draft_factbook=draft_factbook,
+        )
+        issue_id = str(issue.get('issue_id', ''))
+        if str(recommendation.get('issue_id', '')) != issue_id:
+            raise ValueError(
+                'prefetched recommendation returned issue '
+                f'{recommendation.get("issue_id")!r} for requested issue {issue_id!r}'
+            )
+        validate_recommendation(recommendation, valid_options)
+        return issue, recommendation
+
+    with make_all_issues_progress(console) as progress:
+        task = progress.add_task(
+            'Prefetching model advice',
+            total=len(issues_to_prefetch),
+        )
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = {
+                executor.submit(request_advice, issue): str(issue.get('issue_id', ''))
+                for issue in issues_to_prefetch
+            }
+            for future in as_completed(futures):
+                issue_id = futures[future]
+                try:
+                    issue, recommendation = future.result()
+                except Exception as exc:
+                    progress.console.print(
+                        f'Parallel advice prefetch failed for issue {issue_id}: {exc}'
+                    )
+                    progress.console.print(
+                        'Sequential all-issues processing will retry that issue.'
+                    )
+                else:
+                    cache.save_advice(
+                        nation=nation,
+                        live_issue=issue,
+                        recommendation=recommendation,
+                        source=(
+                            'fallback'
+                            if is_fallback_recommendation(recommendation)
+                            else 'ai'
+                        ),
+                    )
+                    progress.console.print(f'Prefetched advice for issue {issue_id}.')
+                progress.advance(task)
+
+
 def run_all_issues(
     args: argparse.Namespace,
     *,
@@ -436,6 +562,12 @@ def run_all_issues(
     profile: dict[str, Any] | None,
     nation_snapshot_xml: str,
     get_governor: Any,
+    lm_base_url: str,
+    lm_model: str | None,
+    lm_api_key: str,
+    draft_dispatch: bool,
+    draft_factbook: bool,
+    valid_options: dict[str, set[str]],
 ) -> None:
     plan = get_or_create_issue_order_plan(
         args=args,
@@ -468,6 +600,24 @@ def run_all_issues(
 
     print()
     print('Press Escape to cancel the all-issues run before the next action is submitted.')
+
+    prefetch_issue_advice(
+        args=args,
+        nation=nation,
+        ordered_issue_ids=ordered_issue_ids,
+        live_issues=live_issues,
+        cache=cache,
+        strategy=strategy,
+        profile=profile,
+        nation_snapshot_xml=nation_snapshot_xml,
+        lm_base_url=lm_base_url,
+        lm_model=lm_model,
+        lm_api_key=lm_api_key,
+        draft_dispatch=draft_dispatch,
+        draft_factbook=draft_factbook,
+        valid_options=valid_options,
+        console=console,
+    )
 
     completed = 0
     with EscapeCancelMonitor(enabled=True) as cancel_monitor:
@@ -676,6 +826,12 @@ def run_advise(args: argparse.Namespace) -> None:
             profile=profile,
             nation_snapshot_xml=nation_snapshot_xml,
             get_governor=get_governor,
+            lm_base_url=lm_base_url,
+            lm_model=lm_model,
+            lm_api_key=lm_api_key,
+            draft_dispatch=draft_dispatch,
+            draft_factbook=draft_factbook,
+            valid_options=valid_options,
         )
         return
 

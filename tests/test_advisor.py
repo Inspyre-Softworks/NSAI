@@ -753,6 +753,7 @@ def test_auto_validation_blocks_zero_alignment_enact() -> None:
 def test_valid_auto_enact_calls_action_endpoint(
     tmp_path,
     monkeypatch,
+    capsys,
 ) -> None:
     monkeypatch.setenv('NSAI_CONFIG_HOME', str(tmp_path / 'config-home'))
     profile_path = write_auto_profile(tmp_path)
@@ -813,11 +814,174 @@ def test_valid_auto_enact_calls_action_endpoint(
 
     run_advise(advise_args(tmp_path, profile_path=profile_path))
 
+    output = capsys.readouterr().out
+    assert 'Decision Summary' in output
+    assert 'NationStates accepted the issue action.' in output
     assert fake_ns.answer_calls == [('Oringrad', '123', '2')]
     audit_entry = json.loads((tmp_path / 'audit.jsonl').read_text(encoding='utf-8'))
     assert audit_entry['action'] == 'auto_enact'
     assert audit_entry['action_applied'] is True
     assert audit_entry['blocked'] is False
+
+
+def test_decision_summary_can_be_disabled(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.setenv('NSAI_CONFIG_HOME', str(tmp_path / 'config-home'))
+    profile_path = write_auto_profile(tmp_path)
+
+    class FakeNationStatesClient:
+        user_agent = 'NSAI-Test/0.1 contact:test@example.com nation:Oringrad'
+        api_version = None
+
+        def public_nation(self, nation, shards):
+            return ET.fromstring('<NATION id="oringrad"><FULLNAME>Oringrad</FULLNAME></NATION>')
+
+        def issues(self, nation):
+            return ET.fromstring(
+                '''
+                <NATION>
+                  <ISSUES>
+                    <ISSUE id="123">
+                      <TITLE>Robot Teachers</TITLE>
+                      <TEXT>Schools want robot teachers.</TEXT>
+                      <OPTION id="1">Ban them.</OPTION>
+                      <OPTION id="2">Regulate them.</OPTION>
+                    </ISSUE>
+                  </ISSUES>
+                </NATION>
+                '''
+            )
+
+    class FakeGovernor:
+        def __init__(self, *, base_url=None, model=None, api_key=None):
+            self.base_url = base_url or 'http://localhost:1234/v1'
+            self.model = model or 'test-model'
+
+        def advise(self, *, live_issues, **kwargs):
+            return {
+                **sample_recommendation(),
+                'issue_id': '123',
+                'option_id': '2',
+                'model': self.model,
+            }
+
+    monkeypatch.setattr(
+        live.NationStatesClient,
+        'from_env',
+        classmethod(lambda cls, nation_config=None: FakeNationStatesClient()),
+    )
+    monkeypatch.setattr(live, 'LocalGovernor', FakeGovernor)
+
+    args = advise_args(tmp_path, profile_path=profile_path)
+    args.auto = False
+    args.decision_summary = False
+
+    run_advise(args)
+
+    output = capsys.readouterr().out
+    assert 'Advisor mode only. No issue action was submitted.' in output
+    assert 'Decision Summary' not in output
+
+
+def test_all_issues_uses_cached_order_plan(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.setenv('NSAI_CONFIG_HOME', str(tmp_path / 'config-home'))
+    profile_path = write_auto_profile(tmp_path)
+
+    class FakeNationStatesClient:
+        user_agent = 'NSAI-Test/0.1 contact:test@example.com nation:Oringrad'
+        api_version = None
+
+        def public_nation(self, nation, shards):
+            return ET.fromstring('<NATION id="oringrad"><FULLNAME>Oringrad</FULLNAME></NATION>')
+
+        def issues(self, nation):
+            return ET.fromstring(
+                '''
+                <NATION>
+                  <ISSUES>
+                    <ISSUE id="123">
+                      <TITLE>Robot Teachers</TITLE>
+                      <TEXT>Schools want robot teachers.</TEXT>
+                      <OPTION id="1">Ban them.</OPTION>
+                      <OPTION id="2">Regulate them.</OPTION>
+                    </ISSUE>
+                    <ISSUE id="456">
+                      <TITLE>Orbital Farms</TITLE>
+                      <TEXT>Farmers want orbital hydroponics grants.</TEXT>
+                      <OPTION id="1">Fund them.</OPTION>
+                    </ISSUE>
+                  </ISSUES>
+                </NATION>
+                '''
+            )
+
+    class FakeGovernor:
+        plan_calls = 0
+        advise_issue_ids: list[str] = []
+
+        def __init__(self, *, base_url=None, model=None, api_key=None):
+            self.base_url = base_url or 'http://localhost:1234/v1'
+            self.model = model or 'test-model'
+
+        def plan_issue_order(self, **kwargs):
+            FakeGovernor.plan_calls += 1
+            return {
+                'ordered_issue_ids': ['456', '123'],
+                'reasons': {
+                    '456': 'Food security is most urgent.',
+                    '123': 'Education policy can follow.',
+                },
+                'model': self.model,
+                'token_usage': {'total_tokens': 12},
+            }
+
+        def advise(self, *, live_issues, **kwargs):
+            issue = live_issues[0]
+            issue_id = str(issue['issue_id'])
+            FakeGovernor.advise_issue_ids.append(issue_id)
+            return {
+                **sample_recommendation(),
+                'issue_id': issue_id,
+                'option_id': str(issue['options'][0]['option_id']),
+                'headline': f'Handle issue {issue_id}',
+                'model': self.model,
+            }
+
+    monkeypatch.setattr(
+        live.NationStatesClient,
+        'from_env',
+        classmethod(lambda cls, nation_config=None: FakeNationStatesClient()),
+    )
+    monkeypatch.setattr(live, 'LocalGovernor', FakeGovernor)
+
+    args = advise_args(tmp_path, profile_path=profile_path)
+    args.all_issues = True
+    args.auto = False
+    args.refresh_advice = False
+    args.flag_display = 'none'
+
+    run_advise(args)
+    first_output = capsys.readouterr().out
+
+    assert FakeGovernor.plan_calls == 1
+    assert FakeGovernor.advise_issue_ids == ['456', '123']
+    assert 'All-Issues Plan' in first_output
+    assert '1. Orbital Farms (456)' in first_output
+    assert first_output.count('Decision Summary') == 2
+
+    run_advise(args)
+    second_output = capsys.readouterr().out
+
+    assert FakeGovernor.plan_calls == 1
+    assert FakeGovernor.advise_issue_ids == ['456', '123']
+    assert 'AI step skipped: reused cached all-issues order plan.' in second_output
 
 
 def test_auto_refreshes_unsafe_cached_advice_before_action(

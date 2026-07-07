@@ -95,6 +95,32 @@ def test_cache_stores_issue_choice_and_advice_separately(tmp_path) -> None:
     assert cache.get_advice('Oringrad', '123') is not None
 
 
+def test_cache_stores_issue_order_plan_by_issue_set(tmp_path) -> None:
+    cache = AdviceCache(tmp_path / 'advice.sqlite3')
+    issues = sample_live_issues()
+
+    cache.save_issue_plan(
+        nation='Oringrad',
+        live_issues=issues,
+        ordered_issue_ids=['456', '123'],
+        reasons={
+            '456': 'Food security is most urgent.',
+            '123': 'Education policy can follow.',
+        },
+        source='ai',
+        token_usage={'total_tokens': 42},
+    )
+
+    plan = cache.get_issue_plan('Oringrad', issues)
+
+    assert plan is not None
+    assert plan.ordered_issue_ids == ['456', '123']
+    assert plan.reasons['456'] == 'Food security is most urgent.'
+    assert plan.source == 'ai'
+    assert plan.token_usage['total_tokens'] == 42
+    assert cache.get_issue_plan('Oringrad', issues[:1]) is None
+
+
 def test_cache_records_enactment_outcomes(tmp_path) -> None:
     cache = AdviceCache(tmp_path / 'advice.sqlite3')
     issues = sample_live_issues()

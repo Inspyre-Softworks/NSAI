@@ -792,6 +792,24 @@ def add_advise_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
     parser.add_argument(
+        '--all-issues',
+        '--all',
+        dest='all_issues',
+        action='store_true',
+        help=(
+            'Process every live issue in a cached advisor-chosen order. '
+            'Press Escape to cancel between issues or before action submission.'
+        ),
+    )
+
+    parser.add_argument(
+        '--decision-summary',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Print a concise resolution and reasoning summary for each decision.',
+    )
+
+    parser.add_argument(
         '--draft-dispatch',
         action=argparse.BooleanOptionalAction,
         default=None,

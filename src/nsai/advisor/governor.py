@@ -505,6 +505,9 @@ class LocalGovernor:
         strategy: str,
         profile: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        # Late import to avoid circular dependency (recommendations imports from governor)
+        from nsai.advisor.recommendations import fallback_issue_choice
+
         valid_issue_ids = [str(issue['issue_id']) for issue in live_issues]
         governor_instruction = build_governor_instruction(profile, strategy)
 
@@ -631,6 +634,161 @@ Rules:
         if repaired:
             selection['structured_output_repaired'] = True
         return selection
+
+    def plan_issue_order(
+        self,
+        *,
+        nation_snapshot_xml: str,
+        live_issues: list[dict[str, Any]],
+        strategy: str,
+        profile: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        # Late import to avoid circular dependency (recommendations imports from governor)
+        from nsai.advisor.recommendations import fallback_issue_order
+
+        valid_issue_ids = [str(issue['issue_id']) for issue in live_issues]
+        governor_instruction = build_governor_instruction(profile, strategy)
+
+        system = """
+You are an AI governor/advisor for a NationStates player.
+
+Return strict JSON only. No markdown.
+
+Sort all live_issues into the order they should be resolved.
+
+Rules:
+- Include every live issue exactly once.
+- issue_id values must be copied exactly from the provided live_issues list.
+- Do not invent issue IDs.
+- Prefer the user's governance profile over your own politics.
+- Put urgent, high-impact, red-line-sensitive, or strategically consequential issues first.
+- Keep each reason to one short sentence.
+"""
+
+        user = {
+            'governor_instruction': governor_instruction,
+            'profile_summary': compact_profile_for_ai(profile),
+            'fallback_strategy': compact_prompt_text(strategy),
+            'nation_context': compact_nation_context(nation_snapshot_xml),
+            'live_issues': compact_live_issues_for_ai(live_issues),
+        }
+
+        messages = [
+            {'role': 'system', 'content': system},
+            {'role': 'user', 'content': json.dumps(user, indent=2, ensure_ascii=False)},
+        ]
+
+        order_schema = {
+            'type': 'object',
+            'properties': {
+                'issue_order': {
+                    'type': 'array',
+                    'minItems': len(valid_issue_ids),
+                    'maxItems': len(valid_issue_ids),
+                    'items': {
+                        'type': 'object',
+                        'properties': {
+                            'issue_id': {
+                                'type': 'string',
+                                'enum': valid_issue_ids,
+                            },
+                            'why_this_issue_now': {
+                                'type': 'string',
+                            },
+                        },
+                        'required': ['issue_id', 'why_this_issue_now'],
+                        'additionalProperties': False,
+                    },
+                },
+            },
+            'required': ['issue_order'],
+            'additionalProperties': False,
+        }
+
+        try:
+            response = self._chat_completion_with_reload_retry(
+                step_name='issue ordering',
+                pulse_label=f'AI step: ordering {len(live_issues)} live issues',
+                model=self.model,
+                messages=messages,
+                temperature=0.1,
+                response_format={
+                    'type': 'json_schema',
+                    'json_schema': {
+                        'name': 'NationStatesIssueOrder',
+                        'schema': order_schema,
+                        'strict': True,
+                    },
+                },
+            )
+        except Exception as exc:
+            print(f'[issue ordering failed. Using deterministic order: {exc}]')
+            plan = fallback_issue_order(live_issues, strategy)
+            plan.update({
+                'ai_step_failed': True,
+                'ai_step_error': str(exc),
+            })
+            return plan
+
+        text = get_completion_text(response)
+        if not text:
+            print('[AI returned no issue order. Using deterministic order.]')
+            plan = fallback_issue_order(live_issues, strategy)
+            plan['token_usage'] = extract_token_usage(response)
+            plan['ai_step_failed'] = True
+            plan['ai_step_error'] = 'AI returned no issue order.'
+            plan['structured_output_repaired'] = True
+            return plan
+
+        try:
+            payload, repaired = parse_json_object_with_repair(text)
+        except Exception as exc:
+            print('[AI returned unparsable issue order. Using deterministic order.]')
+            print('[Raw AI text follows]')
+            print(text)
+            plan = fallback_issue_order(live_issues, strategy)
+            plan['token_usage'] = extract_token_usage(response)
+            plan['ai_step_failed'] = True
+            plan['ai_step_error'] = str(exc)
+            plan['structured_output_repaired'] = True
+            plan['structured_output_error'] = str(exc)
+            return plan
+
+        order_entries = payload.get('issue_order')
+        if not isinstance(order_entries, list):
+            print('[AI issue order was malformed. Using deterministic order.]')
+            plan = fallback_issue_order(live_issues, strategy)
+            plan['token_usage'] = extract_token_usage(response)
+            plan['structured_output_repaired'] = True
+            return plan
+
+        ordered_issue_ids: list[str] = []
+        reasons: dict[str, str] = {}
+        for entry in order_entries:
+            if not isinstance(entry, dict):
+                continue
+
+            issue_id = str(entry.get('issue_id', '')).strip()
+            if issue_id in valid_issue_ids and issue_id not in ordered_issue_ids:
+                ordered_issue_ids.append(issue_id)
+                reasons[issue_id] = str(entry.get('why_this_issue_now', '')).strip()
+
+        if set(ordered_issue_ids) != set(valid_issue_ids):
+            print('[AI issue order missed or duplicated live issues. Using deterministic order.]')
+            plan = fallback_issue_order(live_issues, strategy)
+            plan['token_usage'] = extract_token_usage(response)
+            plan['structured_output_repaired'] = True
+            return plan
+
+        plan = {
+            'ordered_issue_ids': ordered_issue_ids,
+            'reasons': reasons,
+            'model': self.model,
+            'token_usage': extract_token_usage(response),
+        }
+        if repaired:
+            plan['structured_output_repaired'] = True
+        return plan
 
     def advise(
         self,

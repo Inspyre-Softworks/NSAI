@@ -212,8 +212,11 @@ def require_windows_hello(reason: str) -> None:
             return
 
         timeout = windows_hello_timeout_seconds()
+        # Use a fixed message to avoid echoing the reason (which may contain
+        # credential key names) to the terminal; the full reason is shown
+        # inside the system Windows Hello consent dialog.
         print(
-            f'Windows Hello verification required: {reason}',
+            'Windows Hello verification required.',
             file=sys.stderr,
             flush=True,
         )

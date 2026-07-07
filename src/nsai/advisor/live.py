@@ -23,6 +23,8 @@ from typing import Any
 
 import requests
 from rich.console import Console
+from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn
+from rich.table import Column
 
 from nsai.advisor.cache import AdviceCache, CachedAdvice, live_issue_by_id  # noqa: F401
 from nsai.advisor.client import (  # noqa: F401
@@ -163,6 +165,9 @@ from nsai.secure_store import (  # noqa: F401
 
 LM_BASE_URL = os.environ.get('LM_STUDIO_BASE_URL', DEFAULT_LM_BASE_URL)
 LM_MODEL = os.environ.get('LM_STUDIO_MODEL')
+ALL_ISSUES_PROGRESS_DESCRIPTION_WIDTH = 56
+ALL_ISSUES_PROGRESS_BAR_WIDTH = 30
+ALL_ISSUES_PROGRESS_REFRESH_PER_SECOND = 1.0
 
 
 class AdvisorCancelled(RuntimeError):
@@ -228,6 +233,36 @@ def compact_summary_text(value: Any, *, limit: int = 260) -> str:
         return text
 
     return text[: max(0, limit - 3)].rstrip() + '...'
+
+
+def compact_progress_text(value: Any) -> str:
+    return compact_summary_text(
+        value,
+        limit=ALL_ISSUES_PROGRESS_DESCRIPTION_WIDTH,
+    )
+
+
+def make_all_issues_progress(console: Console) -> Progress:
+    return Progress(
+        TextColumn(
+            '{task.description}',
+            markup=False,
+            table_column=Column(
+                width=ALL_ISSUES_PROGRESS_DESCRIPTION_WIDTH,
+                overflow='ellipsis',
+                no_wrap=True,
+            ),
+        ),
+        BarColumn(bar_width=ALL_ISSUES_PROGRESS_BAR_WIDTH),
+        TextColumn(
+            '{task.completed:.0f}/{task.total:.0f}',
+            justify='right',
+            table_column=Column(width=7, justify='right', no_wrap=True),
+        ),
+        TimeElapsedColumn(),
+        console=console,
+        refresh_per_second=ALL_ISSUES_PROGRESS_REFRESH_PER_SECOND,
+    )
 
 
 def recommendation_reason_summary(recommendation: dict[str, Any]) -> str:
@@ -436,22 +471,24 @@ def run_all_issues(
 
     completed = 0
     with EscapeCancelMonitor(enabled=True) as cancel_monitor:
-        with make_progress(console) as progress:
-            overall = progress.add_task('All live issues', total=len(ordered_issue_ids))
-            current = progress.add_task('Current issue', total=1)
+        with make_all_issues_progress(console) as progress:
+            overall = progress.add_task(
+                'All live issues',
+                total=len(ordered_issue_ids),
+            )
             for index, issue_id in enumerate(ordered_issue_ids, start=1):
                 if cancel_monitor.cancel_requested():
                     progress.console.print('All-issues run cancelled by Escape.')
                     break
 
                 issue = issue_by_id.get(issue_id) or {}
-                title = compact_summary_text(issue.get('title')) or 'Untitled issue'
+                title = compact_progress_text(issue.get('title')) or 'Untitled issue'
                 progress.update(
-                    current,
+                    overall,
                     description=f'Issue {index}/{len(ordered_issue_ids)}: {title}',
-                    completed=0,
-                    total=1,
+                    completed=completed,
                 )
+                progress.refresh()
 
                 child_args = clone_args_for_issue(
                     args,
@@ -462,15 +499,19 @@ def run_all_issues(
                     cancel_monitor=cancel_monitor,
                     shared_governor=getattr(args, '_shared_governor', None),
                 )
+                progress.stop()
                 try:
                     run_advise(child_args)
                 except AdvisorCancelled:
+                    progress.start()
                     progress.console.print('All-issues run cancelled by Escape.')
                     break
+                finally:
+                    if not progress.live.is_started:
+                        progress.start()
 
                 completed += 1
-                progress.update(current, completed=1)
-                progress.advance(overall)
+                progress.update(overall, completed=completed)
 
     print()
     print(f'All-issues run complete: processed {completed}/{len(ordered_issue_ids)} issue(s).')

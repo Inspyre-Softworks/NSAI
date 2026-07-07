@@ -984,6 +984,18 @@ def test_all_issues_uses_cached_order_plan(
     assert 'AI step skipped: reused cached all-issues order plan.' in second_output
 
 
+def test_all_issues_progress_uses_stable_timer_layout() -> None:
+    progress = live.make_all_issues_progress(Console(record=True))
+
+    assert [type(column).__name__ for column in progress.columns] == [
+        'TextColumn',
+        'BarColumn',
+        'TextColumn',
+        'TimeElapsedColumn',
+    ]
+    assert progress.live.refresh_per_second == live.ALL_ISSUES_PROGRESS_REFRESH_PER_SECOND
+
+
 def test_auto_refreshes_unsafe_cached_advice_before_action(
     tmp_path,
     monkeypatch,

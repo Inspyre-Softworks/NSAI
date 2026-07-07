@@ -137,6 +137,7 @@ from nsai.advisor.safety import (  # noqa: F401
     validate_auto_action,
     validate_recommendation_consistency,
 )
+from nsai.help import NSAIArgumentParser
 from nsai.nations import (  # noqa: F401
     NationConfig,
     advice_cache_path,
@@ -1224,7 +1225,7 @@ def main() -> None:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = NSAIArgumentParser(
         description='AI-assisted NationStates live governor/advisor.'
     )
     add_advise_arguments(parser)

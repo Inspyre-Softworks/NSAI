@@ -6,6 +6,7 @@ import argparse
 import sys
 
 from nsai import __version__
+from nsai.help import NSAIArgumentParser
 from nsai.advisor.live import (
     add_advise_arguments,
     add_publications_arguments,
@@ -22,7 +23,7 @@ from nsai.profile.builder import (
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = NSAIArgumentParser(
         prog='nsai',
         description='NationStates AI profile builder and live advisor.',
     )

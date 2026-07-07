@@ -5,6 +5,32 @@ import pytest
 import nsai.nations as nations
 from nsai import __version__
 from nsai.cli import build_parser, main
+from nsai.help import NSAIArgumentParser, NSAIHelpFormatter
+
+
+def _subparser(parser, name: str):
+    subparsers_action = next(
+        action
+        for action in parser._actions
+        if name in (getattr(action, 'choices', None) or {})
+    )
+    return subparsers_action.choices[name]
+
+
+def test_cli_help_uses_rich_formatter() -> None:
+    parser = build_parser()
+    profile_parser = _subparser(parser, 'profile')
+    advise_parser = _subparser(parser, 'advise')
+    profile_interview_parser = _subparser(profile_parser, 'interview')
+
+    assert isinstance(parser, NSAIArgumentParser)
+    assert parser.formatter_class is NSAIHelpFormatter
+    assert isinstance(profile_parser, NSAIArgumentParser)
+    assert profile_parser.formatter_class is NSAIHelpFormatter
+    assert isinstance(advise_parser, NSAIArgumentParser)
+    assert advise_parser.formatter_class is NSAIHelpFormatter
+    assert isinstance(profile_interview_parser, NSAIArgumentParser)
+    assert profile_interview_parser.formatter_class is NSAIHelpFormatter
 
 
 def test_cli_help_surfaces_commands(capsys) -> None:

@@ -358,6 +358,12 @@ def validate_auto_action(
     )
     reasons.extend(consistency.reasons)
 
+    alignment = _alignment_score(recommendation)
+    if _raw_action(recommendation) == 'enact' and alignment is not None and alignment <= 0:
+        reasons.append(
+            'auto action requires a positive alignment score for enacted options.'
+        )
+
     confidence, confidence_error = _parse_unit_interval(recommendation.get('confidence'))
     if confidence_error is None and confidence is not None and confidence < minimum_confidence:
         reasons.append(

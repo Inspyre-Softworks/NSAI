@@ -659,12 +659,20 @@ def run_windows_hello_async(
         # WinRT UI operations require a Single-Threaded Apartment (STA).
         # Without init_apartment(STA) the consent dialog's dispatcher has no
         # apartment context and the dialog silently never appears.
+        winrt_initialized = False
         try:
             from winrt._winrt import STA, init_apartment, uninit_apartment
             init_apartment(STA)
             winrt_initialized = True
-        except Exception:
-            winrt_initialized = False
+        except Exception as exc:
+            errors.append(
+                SecureStoreError(
+                    'Could not initialize the Windows Runtime STA apartment '
+                    'for Windows Hello verification.'
+                )
+            )
+            errors[-1].__cause__ = exc
+            return
 
         # Bring the console window to the foreground so the system-level
         # Windows Hello dialog has a visible anchor when it appears.
@@ -748,12 +756,7 @@ def require_windows_hello(reason: str) -> None:
     if os.name != 'nt':
         raise SecureStoreError('Windows Hello secrets are only supported on Windows.')
 
-    if _windows_hello_verified:
-        return
-
     with _windows_hello_lock:
-        # Double-check inside the lock so that if two threads race through the
-        # first guard above, only one actually runs verification.
         if _windows_hello_verified:
             return
 

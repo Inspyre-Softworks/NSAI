@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import textwrap
 import xml.etree.ElementTree as ET
 from typing import Any
 
-from nsai.advisor.cache import AdviceCache, CachedAdvice, live_issue_by_id
+from nsai.advisor.cache import CachedAdvice, live_issue_by_id
 from nsai.advisor.client import NationStatesError
 from nsai.advisor.governor import maybe_float, wrapped
 from nsai.advisor.safety import (

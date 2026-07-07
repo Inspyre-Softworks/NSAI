@@ -4,11 +4,9 @@ from __future__ import annotations
 
 import json
 import shutil
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any
-
-from rich.console import Console
 
 from nsai.profile.enrichment import append_ai_generated_governance
 
@@ -59,6 +57,8 @@ def enrich_profile_file(
 
     if 'ai_generated' in profile_data and not force:
         print('Profile already contains ai_generated. Use --force to regenerate.')
+        if in_place:
+            return input_path
 
     enriched = append_ai_generated_governance(
         profile_data,

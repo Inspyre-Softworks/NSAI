@@ -14,7 +14,7 @@ from typing import Any
 from nsai.nations import advice_cache_path
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 @dataclass
@@ -24,6 +24,18 @@ class CachedIssueChoice:
     issue_ids: list[str]
     selected_issue_id: str
     why: str
+    source: str
+    token_usage: dict[str, Any]
+    updated_at: str
+
+
+@dataclass
+class CachedIssuePlan:
+    nation: str
+    issue_signature: str
+    issue_ids: list[str]
+    ordered_issue_ids: list[str]
+    reasons: dict[str, str]
     source: str
     token_usage: dict[str, Any]
     updated_at: str
@@ -154,6 +166,22 @@ class AdviceCache:
             )
             connection.execute(
                 '''
+                CREATE TABLE IF NOT EXISTS issue_plans (
+                    nation TEXT NOT NULL,
+                    issue_signature TEXT NOT NULL,
+                    issue_ids_json TEXT NOT NULL,
+                    ordered_issue_ids_json TEXT NOT NULL,
+                    reasons_json TEXT NOT NULL DEFAULT '{}',
+                    source TEXT NOT NULL DEFAULT '',
+                    token_usage_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (nation, issue_signature)
+                )
+                '''
+            )
+            connection.execute(
+                '''
                 CREATE TABLE IF NOT EXISTS issue_advice (
                     nation TEXT NOT NULL,
                     issue_id TEXT NOT NULL,
@@ -207,6 +235,12 @@ class AdviceCache:
                 'token_usage_json',
                 "TEXT NOT NULL DEFAULT '{}'",
             )
+            self._ensure_column(
+                connection,
+                'issue_plans',
+                'token_usage_json',
+                "TEXT NOT NULL DEFAULT '{}'",
+            )
 
     def _ensure_column(
         self,
@@ -221,6 +255,87 @@ class AdviceCache:
         }
         if column not in columns:
             connection.execute(f'ALTER TABLE {table} ADD COLUMN {column} {definition}')
+
+    def get_issue_plan(
+        self,
+        nation: str,
+        live_issues: list[dict[str, Any]],
+    ) -> CachedIssuePlan | None:
+        signature = issue_set_signature(live_issues)
+
+        with self.connect() as connection:
+            row = connection.execute(
+                '''
+                SELECT *
+                FROM issue_plans
+                WHERE nation = ? AND issue_signature = ?
+                ''',
+                (nation, signature),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        return CachedIssuePlan(
+            nation=str(row['nation']),
+            issue_signature=str(row['issue_signature']),
+            issue_ids=json.loads(str(row['issue_ids_json'])),
+            ordered_issue_ids=json.loads(str(row['ordered_issue_ids_json'])),
+            reasons=json.loads(str(row['reasons_json'] or '{}')),
+            source=str(row['source'] or ''),
+            token_usage=json.loads(str(row['token_usage_json'] or '{}')),
+            updated_at=str(row['updated_at']),
+        )
+
+    def save_issue_plan(
+        self,
+        *,
+        nation: str,
+        live_issues: list[dict[str, Any]],
+        ordered_issue_ids: list[str],
+        reasons: dict[str, str] | None = None,
+        source: str = '',
+        token_usage: dict[str, Any] | None = None,
+    ) -> None:
+        now = utc_now()
+        signature = issue_set_signature(live_issues)
+        issue_ids_json = json.dumps(issue_ids_for(live_issues), ensure_ascii=False)
+
+        with self.connect() as connection:
+            connection.execute(
+                '''
+                INSERT INTO issue_plans (
+                    nation,
+                    issue_signature,
+                    issue_ids_json,
+                    ordered_issue_ids_json,
+                    reasons_json,
+                    source,
+                    token_usage_json,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(nation, issue_signature) DO UPDATE SET
+                    issue_ids_json = excluded.issue_ids_json,
+                    ordered_issue_ids_json = excluded.ordered_issue_ids_json,
+                    reasons_json = excluded.reasons_json,
+                    source = excluded.source,
+                    token_usage_json = excluded.token_usage_json,
+                    updated_at = excluded.updated_at
+                ''',
+                (
+                    nation,
+                    signature,
+                    issue_ids_json,
+                    json.dumps([str(issue_id) for issue_id in ordered_issue_ids], ensure_ascii=False),
+                    json.dumps(reasons or {}, ensure_ascii=False),
+                    source,
+                    json.dumps(token_usage or {}, ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
 
     def get_issue_choice(
         self,

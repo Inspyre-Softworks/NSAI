@@ -189,6 +189,36 @@ def fallback_issue_choice(
     raise NationStatesError('No live issues with options were available.')
 
 
+def fallback_issue_order(
+    live_issues: list[dict[str, Any]],
+    strategy: str,
+) -> dict[str, Any]:
+    ordered_issue_ids: list[str] = []
+    reasons: dict[str, str] = {}
+
+    for issue in live_issues:
+        if not issue.get('options'):
+            continue
+
+        issue_id = str(issue['issue_id'])
+        ordered_issue_ids.append(issue_id)
+        reasons[issue_id] = (
+            'Deterministic fallback kept the live issue order because AI ordering '
+            f'was unavailable. Player strategy was: {strategy}'
+        )
+
+    if not ordered_issue_ids:
+        raise NationStatesError('No live issues with options were available.')
+
+    return {
+        'ordered_issue_ids': ordered_issue_ids,
+        'reasons': reasons,
+        'model': 'fallback',
+        'fallback_issue_order_used': True,
+        'requires_review': True,
+    }
+
+
 def fallback_recommendation(
     live_issues: list[dict[str, Any]],
     strategy: str,
@@ -553,4 +583,4 @@ def should_manual_enact(
     return True, ['Manual --enact requested and guardrails passed.']
 
 
-__all__ = ['extract_live_issues', 'collect_issue_option_ids', 'validate_recommendation', 'empty_dispatch_draft', 'empty_factbook_draft', 'validate_publication_drafts', 'fallback_issue_choice', 'fallback_recommendation', 'is_cached_advice_usable', 'print_live_issues', 'print_recommendation', 'print_publication_drafts', 'get_profile_min_confidence', 'get_profile_mode', 'is_fallback_recommendation', 'recommendation_action', 'is_dismiss_recommendation', 'should_auto_enact', 'should_manual_enact']
+__all__ = ['extract_live_issues', 'collect_issue_option_ids', 'validate_recommendation', 'empty_dispatch_draft', 'empty_factbook_draft', 'validate_publication_drafts', 'fallback_issue_choice', 'fallback_issue_order', 'fallback_recommendation', 'is_cached_advice_usable', 'print_live_issues', 'print_recommendation', 'print_publication_drafts', 'get_profile_min_confidence', 'get_profile_mode', 'is_fallback_recommendation', 'recommendation_action', 'is_dismiss_recommendation', 'should_auto_enact', 'should_manual_enact']

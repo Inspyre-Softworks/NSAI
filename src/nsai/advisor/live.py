@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -70,6 +71,7 @@ from nsai.advisor.recommendations import (  # noqa: F401
     empty_factbook_draft,
     extract_live_issues,
     fallback_issue_choice,
+    fallback_issue_order,
     fallback_recommendation,
     get_profile_min_confidence,
     get_profile_mode,
@@ -162,6 +164,317 @@ LM_BASE_URL = os.environ.get('LM_STUDIO_BASE_URL', DEFAULT_LM_BASE_URL)
 LM_MODEL = os.environ.get('LM_STUDIO_MODEL')
 
 
+class AdvisorCancelled(RuntimeError):
+    """Raised when the user cancels an all-issues run with Escape."""
+
+
+class EscapeCancelMonitor:
+    """Background Escape-key monitor for long all-issues advisor runs."""
+
+    def __init__(self, *, enabled: bool = True) -> None:
+        self.enabled = enabled
+        self._cancelled = threading.Event()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def __enter__(self) -> 'EscapeCancelMonitor':
+        if not self.enabled or not sys.stdin.isatty() or os.name != 'nt':
+            return self
+
+        self._thread = threading.Thread(
+            target=self._watch_windows_escape,
+            name='NSAIAllIssuesEscapeMonitor',
+            daemon=True,
+        )
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self._stop.set()
+
+    def _watch_windows_escape(self) -> None:
+        try:
+            import msvcrt
+        except ImportError:
+            return
+
+        while not self._stop.is_set() and not self._cancelled.is_set():
+            try:
+                if msvcrt.kbhit() and msvcrt.getwch() == '\x1b':
+                    self._cancelled.set()
+                    return
+            except OSError:
+                return
+            time.sleep(0.05)
+
+    def cancel_requested(self) -> bool:
+        return self._cancelled.is_set()
+
+
+def cancel_requested(args: argparse.Namespace) -> bool:
+    monitor = getattr(args, '_cancel_monitor', None)
+    return bool(monitor and monitor.cancel_requested())
+
+
+def raise_if_cancelled(args: argparse.Namespace) -> None:
+    if cancel_requested(args):
+        raise AdvisorCancelled('Cancelled by Escape.')
+
+
+def compact_summary_text(value: Any, *, limit: int = 260) -> str:
+    text = ' '.join(str(value or '').split())
+    if len(text) <= limit:
+        return text
+
+    return text[: max(0, limit - 3)].rstrip() + '...'
+
+
+def recommendation_reason_summary(recommendation: dict[str, Any]) -> str:
+    for key in ('reasoning', 'audit_summary', 'why_this_issue_first', 'headline'):
+        text = compact_summary_text(recommendation.get(key))
+        if text:
+            return text
+
+    return 'No reasoning summary was provided.'
+
+
+def print_decision_summary(
+    *,
+    selected_issue: dict[str, Any],
+    recommendation: dict[str, Any],
+    action_mode: str,
+    should_enact: bool,
+    action_applied: bool,
+    action_reasons: list[str],
+    auto_block_reasons: list[str],
+    result_error: str,
+) -> None:
+    issue_title = compact_summary_text(selected_issue.get('title')) or 'Untitled issue'
+    issue_id = str(selected_issue.get('issue_id', '')).strip()
+    action = recommendation_action(recommendation)
+    option_id = str(recommendation.get('option_id', '')).strip() or DISMISS_OPTION_ID
+
+    if action_applied:
+        resolution = 'NationStates accepted the issue action.'
+    elif result_error:
+        resolution = f'NationStates returned an issue-action error: {result_error}'
+    elif should_enact:
+        resolution = 'The advisor decided to submit the issue action.'
+    elif action_mode == 'requires_review' or auto_block_reasons:
+        resolution = 'The decision requires review; no NationStates action was submitted.'
+    else:
+        resolution = 'Advisor-only decision; no NationStates action was submitted.'
+
+    print()
+    print('Decision Summary')
+    print('=' * 88)
+    print(f'Issue:      {issue_title} ({issue_id})')
+    print(f'Decision:   {action} option {option_id} via {action_mode}')
+    print(f'Resolution: {resolution}')
+    print(f'Reasoning:  {recommendation_reason_summary(recommendation)}')
+    for reason in unique_reasons(action_reasons + auto_block_reasons):
+        print(f' - {reason}')
+
+
+def normalize_issue_order_plan(
+    plan: dict[str, Any],
+    live_issues: list[dict[str, Any]],
+) -> tuple[list[str], dict[str, str]]:
+    valid_issue_ids = [
+        str(issue['issue_id'])
+        for issue in live_issues
+        if issue.get('options')
+    ]
+    ordered_issue_ids = [
+        str(issue_id)
+        for issue_id in plan.get('ordered_issue_ids', [])
+        if str(issue_id) in valid_issue_ids
+    ]
+    ordered_issue_ids = list(dict.fromkeys(ordered_issue_ids))
+    for issue_id in valid_issue_ids:
+        if issue_id not in ordered_issue_ids:
+            ordered_issue_ids.append(issue_id)
+
+    reasons_raw = plan.get('reasons') if isinstance(plan.get('reasons'), dict) else {}
+    reasons = {
+        str(issue_id): compact_summary_text(reasons_raw.get(str(issue_id)))
+        for issue_id in ordered_issue_ids
+    }
+    return ordered_issue_ids, reasons
+
+
+def get_or_create_issue_order_plan(
+    *,
+    args: argparse.Namespace,
+    cache: AdviceCache,
+    nation: str,
+    live_issues: list[dict[str, Any]],
+    strategy: str,
+    profile: dict[str, Any] | None,
+    nation_snapshot_xml: str,
+    get_governor: Any,
+) -> dict[str, Any]:
+    if not args.refresh_advice:
+        cached_plan = cache.get_issue_plan(nation, live_issues)
+        if cached_plan:
+            live_issue_ids = {
+                str(issue['issue_id'])
+                for issue in live_issues
+                if issue.get('options')
+            }
+            cached_issue_ids = set(cached_plan.ordered_issue_ids)
+            if cached_issue_ids == live_issue_ids:
+                print('AI step skipped: reused cached all-issues order plan.')
+                return {
+                    'ordered_issue_ids': cached_plan.ordered_issue_ids,
+                    'reasons': cached_plan.reasons,
+                    'source': cached_plan.source or 'cache',
+                    'token_usage': cached_plan.token_usage,
+                    'from_cache': True,
+                    'fallback_issue_order_used': cached_plan.source == 'fallback',
+                }
+
+    if len(live_issues) == 1 or getattr(args, 'no_ai', False):
+        plan = fallback_issue_order(live_issues, strategy)
+        plan['source'] = 'fallback'
+    else:
+        plan = get_governor().plan_issue_order(
+            nation_snapshot_xml=nation_snapshot_xml,
+            live_issues=live_issues,
+            strategy=strategy,
+            profile=profile,
+        )
+        plan['source'] = (
+            'fallback'
+            if plan.get('fallback_issue_order_used') or str(plan.get('model', '')).lower() == 'fallback'
+            else 'ai'
+        )
+
+    ordered_issue_ids, reasons = normalize_issue_order_plan(plan, live_issues)
+    plan['ordered_issue_ids'] = ordered_issue_ids
+    plan['reasons'] = reasons
+    cache.save_issue_plan(
+        nation=nation,
+        live_issues=live_issues,
+        ordered_issue_ids=ordered_issue_ids,
+        reasons=reasons,
+        source=str(plan.get('source') or ''),
+        token_usage=dict(plan.get('token_usage') or {}),
+    )
+    print(f'Saved all-issues order plan: {cache.path}')
+    return plan
+
+
+def clone_args_for_issue(
+    args: argparse.Namespace,
+    *,
+    issue_id: str,
+    reason: str,
+    plan_source: str,
+    plan_fallback_used: bool,
+    cancel_monitor: EscapeCancelMonitor,
+    shared_governor: LocalGovernor | None,
+) -> argparse.Namespace:
+    child_args = argparse.Namespace(**vars(args))
+    child_args.all_issues = False
+    child_args._target_issue_id = issue_id
+    child_args._target_issue_reason = reason
+    child_args._target_issue_source = plan_source or 'all_issues_plan'
+    child_args._target_issue_order_fallback = plan_fallback_used
+    child_args._cancel_monitor = cancel_monitor
+    child_args._shared_governor = shared_governor
+    child_args._all_issues_child = True
+    child_args.show_issues = False
+    child_args.show_instruction = False
+    child_args.flag_display = 'none'
+    return child_args
+
+
+def run_all_issues(
+    args: argparse.Namespace,
+    *,
+    nation: str,
+    live_issues: list[dict[str, Any]],
+    cache: AdviceCache,
+    strategy: str,
+    profile: dict[str, Any] | None,
+    nation_snapshot_xml: str,
+    get_governor: Any,
+) -> None:
+    plan = get_or_create_issue_order_plan(
+        args=args,
+        cache=cache,
+        nation=nation,
+        live_issues=live_issues,
+        strategy=strategy,
+        profile=profile,
+        nation_snapshot_xml=nation_snapshot_xml,
+        get_governor=get_governor,
+    )
+    ordered_issue_ids, reasons = normalize_issue_order_plan(plan, live_issues)
+    if not ordered_issue_ids:
+        raise SystemExit('No live issues with options found for all-issues mode.')
+
+    issue_by_id = {str(issue['issue_id']): issue for issue in live_issues}
+    print()
+    print('All-Issues Plan')
+    print('=' * 88)
+    for index, issue_id in enumerate(ordered_issue_ids, start=1):
+        issue = issue_by_id.get(issue_id) or {}
+        title = compact_summary_text(issue.get('title')) or 'Untitled issue'
+        reason = reasons.get(issue_id) or 'No ordering reason was provided.'
+        print(f'{index}. {title} ({issue_id})')
+        print(f'   {reason}')
+
+    console = Console()
+    plan_source = str(plan.get('source') or 'ai')
+    plan_fallback_used = bool(plan.get('fallback_issue_order_used')) or plan_source == 'fallback'
+
+    print()
+    print('Press Escape to cancel the all-issues run before the next action is submitted.')
+
+    completed = 0
+    with EscapeCancelMonitor(enabled=True) as cancel_monitor:
+        with make_progress(console) as progress:
+            overall = progress.add_task('All live issues', total=len(ordered_issue_ids))
+            current = progress.add_task('Current issue', total=1)
+            for index, issue_id in enumerate(ordered_issue_ids, start=1):
+                if cancel_monitor.cancel_requested():
+                    progress.console.print('All-issues run cancelled by Escape.')
+                    break
+
+                issue = issue_by_id.get(issue_id) or {}
+                title = compact_summary_text(issue.get('title')) or 'Untitled issue'
+                progress.update(
+                    current,
+                    description=f'Issue {index}/{len(ordered_issue_ids)}: {title}',
+                    completed=0,
+                    total=1,
+                )
+
+                child_args = clone_args_for_issue(
+                    args,
+                    issue_id=issue_id,
+                    reason=reasons.get(issue_id) or 'Selected from all-issues plan.',
+                    plan_source=plan_source,
+                    plan_fallback_used=plan_fallback_used,
+                    cancel_monitor=cancel_monitor,
+                    shared_governor=getattr(args, '_shared_governor', None),
+                )
+                try:
+                    run_advise(child_args)
+                except AdvisorCancelled:
+                    progress.console.print('All-issues run cancelled by Escape.')
+                    break
+
+                completed += 1
+                progress.update(current, completed=1)
+                progress.advance(overall)
+
+    print()
+    print(f'All-issues run complete: processed {completed}/{len(ordered_issue_ids)} issue(s).')
+
+
 def run_advise(args: argparse.Namespace) -> None:
     save_opts = bool(getattr(args, 'save_opts', False))
     profile_path = Path(args.profile).expanduser().resolve() if args.profile else None
@@ -225,6 +538,7 @@ def run_advise(args: argparse.Namespace) -> None:
         nation_config.draft_factbook if nation_config else None,
     )
     flag_display = str(getattr(args, 'flag_display', 'ascii'))
+    decision_summary = bool(getattr(args, 'decision_summary', True))
 
     if show_instruction:
         print()
@@ -293,7 +607,7 @@ def run_advise(args: argparse.Namespace) -> None:
         print_live_issues(live_issues)
 
     cache = AdviceCache()
-    governor: LocalGovernor | None = None
+    governor: LocalGovernor | None = getattr(args, '_shared_governor', None)
     nation_snapshot_xml = xml_to_string(nation_root)
 
     def get_governor() -> LocalGovernor:
@@ -309,6 +623,19 @@ def run_advise(args: argparse.Namespace) -> None:
 
     if args.refresh_advice:
         print(f'Refreshing advice cache for this run: {advice_cache_path()}')
+
+    if getattr(args, 'all_issues', False):
+        run_all_issues(
+            args,
+            nation=nation,
+            live_issues=live_issues,
+            cache=cache,
+            strategy=strategy,
+            profile=profile,
+            nation_snapshot_xml=nation_snapshot_xml,
+            get_governor=get_governor,
+        )
+        return
 
     selected_issue_id = ''
     selected_issue_reason = ''
@@ -336,7 +663,30 @@ def run_advise(args: argparse.Namespace) -> None:
             'source': source,
         })
 
-    if not args.refresh_advice:
+    target_issue_id = str(getattr(args, '_target_issue_id', '') or '').strip()
+    if target_issue_id:
+        selected_issue_id = target_issue_id
+        selected_issue_reason = str(
+            getattr(args, '_target_issue_reason', 'Selected from all-issues plan.')
+        )
+        selected_issue_source = str(
+            getattr(args, '_target_issue_source', 'all_issues_plan')
+        )
+        fallback_issue_selection_used = bool(
+            getattr(args, '_target_issue_order_fallback', False)
+        )
+        print(
+            f'Using all-issues plan item: {selected_issue_id} '
+            f'({selected_issue_source}).'
+        )
+        record_ai_step(
+            'issue_selection',
+            'skipped',
+            fallback_used=fallback_issue_selection_used,
+            source=selected_issue_source,
+        )
+
+    if not target_issue_id and not args.refresh_advice:
         cached_choice = cache.get_issue_choice(nation, live_issues)
         if cached_choice and live_issue_by_id(live_issues, cached_choice.selected_issue_id):
             selected_issue_id = cached_choice.selected_issue_id
@@ -436,21 +786,27 @@ def run_advise(args: argparse.Namespace) -> None:
                 source=selected_issue_source,
             )
 
-        cache.save_issue_choice(
-            nation=nation,
-            live_issues=live_issues,
-            selected_issue_id=selected_issue_id,
-            why=selected_issue_reason,
-            source=selected_issue_source,
-            token_usage=selected_issue_token_usage,
-        )
-        print(f'Saved issue choice for current issue set: {selected_issue_id}')
+        if not target_issue_id:
+            cache.save_issue_choice(
+                nation=nation,
+                live_issues=live_issues,
+                selected_issue_id=selected_issue_id,
+                why=selected_issue_reason,
+                source=selected_issue_source,
+                token_usage=selected_issue_token_usage,
+            )
+            print(f'Saved issue choice for current issue set: {selected_issue_id}')
 
     selected_issue = live_issue_by_id(live_issues, selected_issue_id)
     if selected_issue is None:
+        if target_issue_id:
+            print(f'Planned issue {target_issue_id!r} is not live anymore; skipping.')
+            return
         raise NationStatesError(
             f'Cached or selected issue {selected_issue_id!r} is not live anymore.'
         )
+
+    raise_if_cancelled(args)
 
     if not args.refresh_advice:
         cached_advice = cache.get_advice(nation, selected_issue_id)
@@ -493,6 +849,7 @@ def run_advise(args: argparse.Namespace) -> None:
                 )
 
     if recommendation is None:
+        raise_if_cancelled(args)
         selected_live_issues = [selected_issue]
         if no_ai:
             print('AI step skipped: --no-ai is set; using deterministic recommendation.')
@@ -668,8 +1025,10 @@ def run_advise(args: argparse.Namespace) -> None:
     result_xml = None
     publication_results: list[dict[str, Any]] = []
     action_applied = False
+    result_error = ''
 
     if should_enact:
+        raise_if_cancelled(args)
         result = ns.answer_issue(nation, issue_id, option_id)
         result_xml = xml_to_string(result)
         result_error = xml_error_text(result)
@@ -741,6 +1100,18 @@ def run_advise(args: argparse.Namespace) -> None:
                 'Publication drafts were not posted because no issue action was '
                 'submitted.'
             )
+
+    if decision_summary:
+        print_decision_summary(
+            selected_issue=selected_issue,
+            recommendation=recommendation,
+            action_mode=action_mode,
+            should_enact=should_enact,
+            action_applied=action_applied,
+            action_reasons=action_reasons,
+            auto_block_reasons=auto_block_reasons,
+            result_error=result_error,
+        )
 
     write_audit_log(
         Path(audit_log),

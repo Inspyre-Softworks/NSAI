@@ -404,6 +404,92 @@ def test_advise_skips_ai_issue_selection_when_only_one_issue(
     assert 'flag' in shards_seen[0]
 
 
+def test_advise_skips_flag_shard_when_flag_display_none(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.setenv('NSAI_CONFIG_HOME', str(tmp_path / 'config-home'))
+    shards_seen: list[list[str]] = []
+
+    class FakeNationStatesClient:
+        user_agent = 'NSAI-Test/0.1 contact:test@example.com nation:Oringrad'
+        api_version = None
+
+        def public_nation(self, nation, shards):
+            shards_seen.append(list(shards))
+            return ET.fromstring('<NATION id="oringrad"><FULLNAME>Oringrad</FULLNAME></NATION>')
+
+        def issues(self, nation):
+            return ET.fromstring(
+                '''
+                <NATION>
+                  <ISSUES>
+                    <ISSUE id="123">
+                      <TITLE>Robot Teachers</TITLE>
+                      <TEXT>Schools want robot teachers.</TEXT>
+                      <OPTION id="1">Ban them.</OPTION>
+                      <OPTION id="2">Regulate them.</OPTION>
+                    </ISSUE>
+                  </ISSUES>
+                </NATION>
+                '''
+            )
+
+    class FakeGovernor:
+        def __init__(self, *, base_url=None, model=None, api_key=None):
+            self.base_url = base_url or 'http://localhost:1234/v1'
+            self.model = model or 'test-model'
+
+        def select_issue(self, **kwargs):
+            raise AssertionError('select_issue should not be called for one live issue')
+
+        def advise(self, *, live_issues, **kwargs):
+            return {
+                **sample_recommendation(),
+                'issue_id': '123',
+                'option_id': '2',
+                'model': self.model,
+            }
+
+    monkeypatch.setattr(
+        live.NationStatesClient,
+        'from_env',
+        classmethod(lambda cls, nation_config=None: FakeNationStatesClient()),
+    )
+    monkeypatch.setattr(live, 'LocalGovernor', FakeGovernor)
+
+    args = SimpleNamespace(
+        save_opts=False,
+        profile=None,
+        nation='Oringrad',
+        no_nation_config=True,
+        strategy=None,
+        show_issues=False,
+        show_instruction=False,
+        no_ai=False,
+        audit_log=str(tmp_path / 'audit.jsonl'),
+        base_url='http://localhost:1234/v1',
+        model='test-model',
+        lm_api_key=None,
+        secret_backend=None,
+        draft_dispatch=False,
+        draft_factbook=False,
+        refresh_advice=True,
+        enact=False,
+        auto=False,
+        override_red_line=False,
+        flag_display='none',
+    )
+
+    run_advise(args)
+
+    assert shards_seen, 'public_nation should have been called'
+    assert 'flag' not in shards_seen[0], (
+        "flag shard should not be requested when flag_display='none'"
+    )
+
+
 def test_model_reload_issue_selection_retry_blocks_auto_action(
     tmp_path,
     monkeypatch,

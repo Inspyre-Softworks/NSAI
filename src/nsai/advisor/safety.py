@@ -9,6 +9,7 @@ from typing import Any
 
 DISMISS_OPTION_ID = '-1'
 ALLOWED_ACTIONS = {'enact', 'dismiss'}
+SUSPICIOUS_CONFIDENCE_THRESHOLD = 0.95
 
 
 @dataclass(frozen=True)
@@ -274,7 +275,7 @@ def validate_recommendation_consistency(
 
     alignment = _alignment_score(recommendation)
     if alignment is not None and confidence is not None:
-        if alignment <= 0 and confidence >= 0.80:
+        if alignment <= 0 and confidence >= SUSPICIOUS_CONFIDENCE_THRESHOLD:
             reasons.append(
                 f'confidence {confidence:.2f} is suspiciously high while '
                 f'alignment_score is {alignment:g}.'

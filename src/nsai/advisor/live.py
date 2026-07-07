@@ -16,11 +16,15 @@ import textwrap
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
 import requests
 from openai import OpenAI
+from PIL import Image, UnidentifiedImageError
+
+from nsai import __version__ as _NSAI_VERSION
 from rich.console import Console
 from rich.progress import (
     BarColumn,
@@ -75,6 +79,9 @@ LOCAL_MODEL_RELOAD_MAX_ATTEMPTS = 2
 PROMPT_TEXT_LIMIT = 900
 PROMPT_LONG_TEXT_LIMIT = 1800
 PROMPT_LIST_LIMIT = 8
+FLAG_DISPLAY_MODES = {'ascii', 'banner'}
+FLAG_ASCII_WIDTH = 42
+FLAG_ASCII_RAMP = '@%#*+=-:. '
 DISPATCH_CATEGORY_IDS = {
     'factbook': 1,
     'bulletin': 3,
@@ -167,6 +174,17 @@ class RateLimitState:
     reset_seconds: int | None = None
 
 
+def build_default_user_agent(nation: str) -> str:
+    """Build a NationStates-compliant User-Agent for the given nation.
+
+    Used as an automatic fallback when neither NS_USER_AGENT nor a saved
+    per-nation user_agent is available.  The format follows NationStates
+    API etiquette (tool/version contact:script nation:name).
+    """
+    safe_nation = re.sub(r'[^a-zA-Z0-9_-]', '_', nation.strip()) or 'unknown'
+    return f'NSAI/{_NSAI_VERSION} contact:script nation:{safe_nation}'
+
+
 class NationStatesClient:
     """Small NationStates API client with User-Agent and rate-limit handling."""
 
@@ -201,12 +219,12 @@ class NationStatesClient:
             nation_config.user_agent if nation_config else None
         )
         if not user_agent:
-            raise NationStatesError(
-                'Missing NS_USER_AGENT environment variable.\n\n'
-                'PowerShell example:\n'
-                "$env:NS_USER_AGENT='InspyreSoftworksNationGM/0.1 "
-                "contact:you@example.com nation:Oringrad'\n\n"
-                'Or save one with: nsai nation set <nation> --user-agent ...'
+            nation_name = nation_config.nation_name if nation_config else 'unknown'
+            user_agent = build_default_user_agent(nation_name)
+            print(
+                f'NS_USER_AGENT not set; using auto-generated agent: {user_agent}\n'
+                'Set NS_USER_AGENT or run `nsai nation set <nation> --user-agent ...` '
+                'to use a custom agent.'
             )
 
         version_raw = os.environ.get('NS_API_VERSION')
@@ -734,7 +752,10 @@ Rules:
 - If the profile includes a constitution, treat it as binding.
 - If an option violates a red line, mark red_line_triggered true.
 - If all options are bad, use action "dismiss" and explain why.
-- Set confidence and charter_alignment_score honestly; do not use high confidence with low alignment.
+- Set confidence and charter_alignment_score honestly.
+- charter_alignment_score is required: use a deliberate 0-100 integer that reflects how well the chosen action fits the profile and constitution.
+- Do not leave charter_alignment_score at 0 by default; only use 0 when the recommendation truly has no meaningful alignment.
+- If you cannot give the action a meaningful alignment score above 0, lower confidence or dismiss instead of forcing enactment.
 - Keep reasoning, expected_tradeoffs, and do_not_enact_if concise.
 - Put the final JSON in the normal assistant content field if possible.
 """
@@ -847,6 +868,9 @@ Rules:
                     'type': 'integer',
                     'minimum': 0,
                     'maximum': 100,
+                    'description': (
+                        'Required 0-100 alignment score; do not use 0 as a placeholder.'
+                    ),
                 },
                 'red_line_triggered': {
                     'type': 'boolean',
@@ -1194,6 +1218,72 @@ def wrapped(text: str, width: int = 88) -> str:
     return textwrap.fill(str(text), width=width)
 
 
+def nation_flag_url(nation_root: ET.Element) -> str:
+    return (nation_root.findtext('FLAG') or '').strip()
+
+
+def render_ascii_flag(flag_url: str, *, width: int = FLAG_ASCII_WIDTH) -> str:
+    response = requests.get(flag_url, timeout=15)
+    response.raise_for_status()
+
+    with Image.open(BytesIO(response.content)) as image:
+        image = image.convert('RGBA')
+        background = Image.new('RGBA', image.size, (255, 255, 255, 255))
+        image = Image.alpha_composite(background, image).convert('L')
+
+        target_width = max(8, width)
+        aspect = image.height / image.width if image.width else 1.0
+        target_height = max(1, round(target_width * aspect * 0.5))
+        image = image.resize((target_width, target_height))
+
+        pixels = list(image.getdata())
+        ramp = FLAG_ASCII_RAMP
+        ramp_size = len(ramp) - 1
+        rows = [
+            ''.join(ramp[pixel * ramp_size // 255] for pixel in pixels[index:index + target_width])
+            for index in range(0, len(pixels), target_width)
+        ]
+        return '\n'.join(rows)
+
+
+def render_banner(name: str) -> str:
+    title = f' {name} '
+    width = max(40, len(title) + 8)
+    border = '=' * width
+    return '\n'.join([
+        border,
+        title.center(width),
+        border,
+    ])
+
+
+def print_nation_flag(nation_root: ET.Element, *, flag_display: str = 'ascii') -> None:
+    nation_name = (nation_root.findtext('FULLNAME') or nation_root.get('id') or 'Unknown nation').strip()
+    flag_url = nation_flag_url(nation_root)
+
+    if flag_display == 'banner':
+        print()
+        print(f'Found nation on NationStates: {nation_name}')
+        print(render_banner(nation_name))
+        if flag_url:
+            print(f'Flag source: {flag_url}')
+        return
+
+    if not flag_url:
+        return
+
+    print()
+    print(f'Found nation on NationStates: {nation_name}')
+
+    try:
+        print(render_ascii_flag(flag_url))
+    except (requests.RequestException, OSError, UnidentifiedImageError, ValueError) as exc:
+        print(f'Could not render nation flag as ASCII: {exc}')
+        print(render_banner(nation_name))
+        if flag_url:
+            print(f'Flag source: {flag_url}')
+
+
 def unique_reasons(reasons: list[str]) -> list[str]:
     seen = set()
     unique = []
@@ -1448,6 +1538,8 @@ Binding rules:
 - If every option is bad, dismiss the issue with action "dismiss" and option_id "-1".
 - Never describe dismissing an issue "with Option N"; that means action "enact".
 - Confidence and charter_alignment_score must be honest and mutually consistent.
+- charter_alignment_score is required and should be an intentional 0-100 integer, not a placeholder default.
+- If the score would be 0, the recommendation should probably be dismissed or reconsidered.
 """
 
 
@@ -2733,6 +2825,13 @@ def add_advise_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
     parser.add_argument(
+        '--flag-display',
+        choices=sorted(FLAG_DISPLAY_MODES),
+        default='ascii',
+        help='How to display the nation flag after loading the NationStates nation.',
+    )
+
+    parser.add_argument(
         '--draft-dispatch',
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -3106,6 +3205,7 @@ def run_advise(args: argparse.Namespace) -> None:
     with StatusPulse('NationStates: loading public nation data'):
         nation_root = ns.public_nation(nation, [
             'fullname',
+            'flag',
             'motto',
             'category',
             'region',
@@ -3118,6 +3218,11 @@ def run_advise(args: argparse.Namespace) -> None:
             'policies',
             'legislation',
         ])
+
+    print_nation_flag(
+        nation_root,
+        flag_display=str(getattr(args, 'flag_display', 'ascii')),
+    )
 
     with StatusPulse('NationStates: loading live issues'):
         issues_root = ns.issues(nation)

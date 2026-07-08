@@ -446,6 +446,7 @@ def clone_args_for_issue(
     child_args.show_issues = False
     child_args.show_instruction = False
     child_args.flag_display = 'none'
+    child_args.save_opts = False
     return child_args
 
 
@@ -566,6 +567,8 @@ def run_all_issues(
     args: argparse.Namespace,
     *,
     nation: str,
+    ns: NationStatesClient,
+    nation_root: Any,
     live_issues: list[dict[str, Any]],
     cache: AdviceCache,
     strategy: str,
@@ -659,6 +662,12 @@ def run_all_issues(
                     cancel_monitor=cancel_monitor,
                     shared_governor=getattr(args, '_shared_governor', None),
                 )
+                child_args._preloaded_ns = ns
+                child_args._preloaded_nation_root = nation_root
+                child_args._preloaded_live_issues = live_issues
+                child_args._preloaded_valid_options = valid_options
+                child_args._preloaded_cache = cache
+                child_args._preloaded_nation_snapshot_xml = nation_snapshot_xml
                 progress.stop()
                 try:
                     run_advise(child_args)
@@ -684,6 +693,21 @@ def run_advise(args: argparse.Namespace) -> None:
     profile = load_profile(profile_path) if profile_path else None
     nation_config = None
     automatic_nation_source = None
+    preloaded_ns = getattr(args, '_preloaded_ns', None)
+    preloaded_nation_root = getattr(args, '_preloaded_nation_root', None)
+    preloaded_live_issues = getattr(args, '_preloaded_live_issues', None)
+    preloaded_valid_options = getattr(args, '_preloaded_valid_options', None)
+    preloaded_cache = getattr(args, '_preloaded_cache', None)
+    preloaded_nation_snapshot_xml = getattr(
+        args,
+        '_preloaded_nation_snapshot_xml',
+        None,
+    )
+    using_preloaded_nation_data = (
+        preloaded_ns is not None
+        and preloaded_nation_root is not None
+        and preloaded_live_issues is not None
+    )
 
     try:
         nation = resolve_nation_name(cli_nation=args.nation, profile=profile)
@@ -707,13 +731,14 @@ def run_advise(args: argparse.Namespace) -> None:
     if automatic_nation_source:
         print(f'Using saved nation {nation!r} from {automatic_nation_source}.')
 
-    if nation_config:
+    if nation_config and not using_preloaded_nation_data:
         print(f'Using saved nation config: {config_path_for(nation_config.nation_name)}')
 
     if nation_config and not profile_path and nation_config.profile_path:
         profile_path = Path(nation_config.profile_path).expanduser().resolve()
         profile = load_profile(profile_path)
-        print(f'Using saved profile for {nation}: {profile_path}')
+        if not using_preloaded_nation_data:
+            print(f'Using saved profile for {nation}: {profile_path}')
 
     strategy = args.strategy or (nation_config.strategy if nation_config else None) or DEFAULT_STRATEGY
     show_issues = resolve_bool_option(
@@ -749,7 +774,11 @@ def run_advise(args: argparse.Namespace) -> None:
         print(build_governor_instruction(profile, strategy))
         print()
 
-    ns = NationStatesClient.from_env(nation_config)
+    ns = (
+        preloaded_ns
+        if preloaded_ns is not None
+        else NationStatesClient.from_env(nation_config)
+    )
 
     if save_opts:
         _, _, saved_profile_path = save_advise_options(
@@ -775,42 +804,56 @@ def run_advise(args: argparse.Namespace) -> None:
             profile_path = saved_profile_path
         nation_config = maybe_load_nation_config(nation)
 
-    with StatusPulse('NationStates: loading public nation data'):
-        public_shards = [
-            'fullname',
-            'motto',
-            'category',
-            'region',
-            'population',
-            'freedom',
-            'gdp',
-            'tax',
-            'crime',
-            'govtdesc',
-            'policies',
-            'legislation',
-        ]
-        if flag_display != 'none':
-            public_shards.insert(1, 'flag')
-        nation_root = ns.public_nation(nation, public_shards)
+    if preloaded_nation_root is not None:
+        nation_root = preloaded_nation_root
+    else:
+        with StatusPulse('NationStates: loading public nation data'):
+            public_shards = [
+                'fullname',
+                'motto',
+                'category',
+                'region',
+                'population',
+                'freedom',
+                'gdp',
+                'tax',
+                'crime',
+                'govtdesc',
+                'policies',
+                'legislation',
+            ]
+            if flag_display != 'none':
+                public_shards.insert(1, 'flag')
+            nation_root = ns.public_nation(nation, public_shards)
 
     print_nation_flag(nation_root, flag_display=flag_display)
 
-    with StatusPulse('NationStates: loading live issues'):
-        issues_root = ns.issues(nation)
-    live_issues = extract_live_issues(issues_root)
+    if preloaded_live_issues is not None:
+        live_issues = preloaded_live_issues
+    else:
+        with StatusPulse('NationStates: loading live issues'):
+            issues_root = ns.issues(nation)
+        live_issues = extract_live_issues(issues_root)
 
     if not live_issues:
         raise SystemExit('No live issues found for this nation.')
 
-    valid_options = collect_issue_option_ids(live_issues)
+    valid_options = (
+        preloaded_valid_options
+        if preloaded_valid_options is not None
+        else collect_issue_option_ids(live_issues)
+    )
 
     if show_issues:
         print_live_issues(live_issues)
 
-    cache = AdviceCache()
+    cache = preloaded_cache if preloaded_cache is not None else AdviceCache()
     governor: LocalGovernor | None = getattr(args, '_shared_governor', None)
-    nation_snapshot_xml = xml_to_string(nation_root)
+    nation_snapshot_xml = (
+        preloaded_nation_snapshot_xml
+        if preloaded_nation_snapshot_xml is not None
+        else xml_to_string(nation_root)
+    )
 
     def get_governor() -> LocalGovernor:
         nonlocal governor
@@ -830,6 +873,8 @@ def run_advise(args: argparse.Namespace) -> None:
         run_all_issues(
             args,
             nation=nation,
+            ns=ns,
+            nation_root=nation_root,
             live_issues=live_issues,
             cache=cache,
             strategy=strategy,

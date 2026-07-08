@@ -1094,6 +1094,106 @@ def test_all_issues_reuses_cached_covering_order_plan(
     assert '1. Orbital Farms (456)' in output
 
 
+def test_all_issues_child_runs_reuse_loaded_nationstates_data(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.setenv('NSAI_CONFIG_HOME', str(tmp_path / 'config-home'))
+    profile_path = write_auto_profile(tmp_path)
+
+    class FakeNationStatesClient:
+        user_agent = 'NSAI-Test/0.1 contact:test@example.com nation:Oringrad'
+        api_version = None
+
+        def __init__(self) -> None:
+            self.public_calls = 0
+            self.issue_calls = 0
+
+        def public_nation(self, nation, shards):
+            self.public_calls += 1
+            return ET.fromstring('<NATION id="oringrad"><FULLNAME>Oringrad</FULLNAME></NATION>')
+
+        def issues(self, nation):
+            self.issue_calls += 1
+            return ET.fromstring(
+                '''
+                <NATION>
+                  <ISSUES>
+                    <ISSUE id="123">
+                      <TITLE>Robot Teachers</TITLE>
+                      <TEXT>Schools want robot teachers.</TEXT>
+                      <OPTION id="1">Regulate them.</OPTION>
+                    </ISSUE>
+                    <ISSUE id="456">
+                      <TITLE>Orbital Farms</TITLE>
+                      <TEXT>Farmers want orbital hydroponics grants.</TEXT>
+                      <OPTION id="1">Fund them.</OPTION>
+                    </ISSUE>
+                  </ISSUES>
+                </NATION>
+                '''
+            )
+
+    class FakeGovernor:
+        advise_issue_ids: list[str] = []
+
+        def __init__(self, *, base_url=None, model=None, api_key=None):
+            self.base_url = base_url or 'http://localhost:1234/v1'
+            self.model = model or 'test-model'
+
+        def plan_issue_order(self, **kwargs):
+            return {
+                'ordered_issue_ids': ['456', '123'],
+                'reasons': {
+                    '456': 'Food security is most urgent.',
+                    '123': 'Education policy can follow.',
+                },
+                'model': self.model,
+            }
+
+        def advise(self, *, live_issues, **kwargs):
+            issue = live_issues[0]
+            issue_id = str(issue['issue_id'])
+            FakeGovernor.advise_issue_ids.append(issue_id)
+            return {
+                **sample_recommendation(),
+                'issue_id': issue_id,
+                'option_id': str(issue['options'][0]['option_id']),
+                'headline': f'Handle issue {issue_id}',
+                'model': self.model,
+            }
+
+    fake_ns = FakeNationStatesClient()
+    from_env_calls = 0
+
+    def fake_from_env(cls, nation_config=None):
+        nonlocal from_env_calls
+        from_env_calls += 1
+        return fake_ns
+
+    monkeypatch.setattr(
+        live.NationStatesClient,
+        'from_env',
+        classmethod(fake_from_env),
+    )
+    monkeypatch.setattr(live, 'LocalGovernor', FakeGovernor)
+
+    args = advise_args(tmp_path, profile_path=profile_path)
+    args.all_issues = True
+    args.auto = False
+    args.refresh_advice = False
+    args.flag_display = 'none'
+
+    run_advise(args)
+    capsys.readouterr()
+
+    assert from_env_calls == 1
+    assert fake_ns.public_calls == 1
+    assert fake_ns.issue_calls == 1
+    assert FakeGovernor.advise_issue_ids == ['456', '123']
+
+
 def test_all_issues_parallel_requests_prefetch_missing_advice(
     tmp_path,
     monkeypatch,

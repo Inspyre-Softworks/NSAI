@@ -248,7 +248,11 @@ def compact_progress_text(value: Any) -> str:
     )
 
 
-def make_all_issues_progress(console: Console) -> Progress:
+def make_all_issues_progress(
+    console: Console,
+    *,
+    transient: bool = False,
+) -> Progress:
     return Progress(
         TextColumn(
             '{task.description}',
@@ -268,6 +272,7 @@ def make_all_issues_progress(console: Console) -> Progress:
         TimeElapsedColumn(),
         console=console,
         refresh_per_second=ALL_ISSUES_PROGRESS_REFRESH_PER_SECOND,
+        transient=transient,
     )
 
 
@@ -359,6 +364,8 @@ def get_or_create_issue_order_plan(
     nation_snapshot_xml: str,
     get_governor: Any,
 ) -> dict[str, Any]:
+    processable_issues = [issue for issue in live_issues if issue.get('options')]
+    fallback_plan_notice_printed = False
     if not args.refresh_advice:
         cached_plan = cache.get_issue_plan(nation, live_issues)
         if cached_plan:
@@ -368,7 +375,11 @@ def get_or_create_issue_order_plan(
                 if issue.get('options')
             }
             cached_issue_ids = set(cached_plan.ordered_issue_ids)
-            if cached_issue_ids == live_issue_ids:
+            cached_is_fallback = cached_plan.source == 'fallback'
+            if (
+                cached_issue_ids == live_issue_ids
+                and (not cached_is_fallback or getattr(args, 'no_ai', False))
+            ):
                 print('AI step skipped: reused cached all-issues order plan.')
                 return {
                     'ordered_issue_ids': cached_plan.ordered_issue_ids,
@@ -378,30 +389,53 @@ def get_or_create_issue_order_plan(
                     'from_cache': True,
                     'fallback_issue_order_used': cached_plan.source == 'fallback',
                 }
+            if cached_issue_ids == live_issue_ids and cached_is_fallback:
+                print(
+                    'Cached deterministic fallback all-issues order plan ignored '
+                    'because AI ordering is enabled.'
+                )
+                fallback_plan_notice_printed = True
         cached_covering_plan = cache.get_covering_issue_plan(nation, live_issues)
         if cached_covering_plan:
-            ordered_issue_ids, reasons = normalize_issue_order_plan(
-                {
-                    'ordered_issue_ids': cached_covering_plan.ordered_issue_ids,
-                    'reasons': cached_covering_plan.reasons,
-                },
-                live_issues,
-            )
-            print(
-                'AI step skipped: reused cached all-issues order plan '
-                'for remaining live issues.'
-            )
-            return {
-                'ordered_issue_ids': ordered_issue_ids,
-                'reasons': reasons,
-                'source': cached_covering_plan.source or 'cache',
-                'token_usage': cached_covering_plan.token_usage,
-                'from_cache': True,
-                'from_covering_cache': True,
-                'fallback_issue_order_used': cached_covering_plan.source == 'fallback',
-            }
+            covering_is_fallback = cached_covering_plan.source == 'fallback'
+            if not covering_is_fallback or getattr(args, 'no_ai', False):
+                ordered_issue_ids, reasons = normalize_issue_order_plan(
+                    {
+                        'ordered_issue_ids': cached_covering_plan.ordered_issue_ids,
+                        'reasons': cached_covering_plan.reasons,
+                    },
+                    live_issues,
+                )
+                print(
+                    'AI step skipped: reused cached all-issues order plan '
+                    'for remaining live issues.'
+                )
+                return {
+                    'ordered_issue_ids': ordered_issue_ids,
+                    'reasons': reasons,
+                    'source': cached_covering_plan.source or 'cache',
+                    'token_usage': cached_covering_plan.token_usage,
+                    'from_cache': True,
+                    'from_covering_cache': True,
+                    'fallback_issue_order_used': cached_covering_plan.source == 'fallback',
+                }
+            if not fallback_plan_notice_printed:
+                print(
+                    'Cached deterministic fallback all-issues order plan ignored '
+                    'because AI ordering is enabled.'
+                )
 
-    if len(live_issues) == 1 or getattr(args, 'no_ai', False):
+    if len(processable_issues) == 1:
+        issue_id = str(processable_issues[0]['issue_id'])
+        plan = {
+            'ordered_issue_ids': [issue_id],
+            'reasons': {issue_id: 'Only one live issue with options is present.'},
+            'source': 'single_issue',
+            'model': 'single_issue',
+            'fallback_issue_order_used': False,
+        }
+        print('AI step skipped: only one live issue is present for all-issues order.')
+    elif getattr(args, 'no_ai', False):
         plan = fallback_issue_order(live_issues, strategy)
         plan['source'] = 'fallback'
     else:
@@ -535,7 +569,7 @@ def prefetch_issue_advice(
         validate_recommendation(recommendation, valid_options)
         return issue, recommendation
 
-    with make_all_issues_progress(console) as progress:
+    with make_all_issues_progress(console, transient=True) as progress:
         task = progress.add_task(
             'Prefetching model advice',
             total=len(issues_to_prefetch),

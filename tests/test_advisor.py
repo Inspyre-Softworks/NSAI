@@ -1219,6 +1219,114 @@ def test_all_issues_child_runs_reuse_loaded_nationstates_data(
     assert FakeGovernor.advise_issue_ids == ['456', '123']
 
 
+def test_all_issues_single_issue_order_is_not_auto_blocking_fallback(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.setenv('NSAI_CONFIG_HOME', str(tmp_path / 'config-home'))
+    profile_path = write_auto_profile(tmp_path)
+    stale_live_issues = [
+        {
+            'issue_id': '123',
+            'title': 'Robot Teachers',
+            'text': 'Schools want robot teachers.',
+            'options': [
+                {'option_id': '1', 'text': 'Ban them.'},
+                {'option_id': '2', 'text': 'Regulate them.'},
+            ],
+        }
+    ]
+    live.AdviceCache().save_issue_plan(
+        nation='Oringrad',
+        live_issues=stale_live_issues,
+        ordered_issue_ids=['123'],
+        reasons={'123': 'Deterministic fallback kept the live issue order.'},
+        source='fallback',
+        token_usage={},
+    )
+
+    class FakeNationStatesClient:
+        user_agent = 'NSAI-Test/0.1 contact:test@example.com nation:Oringrad'
+        api_version = None
+
+        def __init__(self) -> None:
+            self.answer_calls = []
+
+        def public_nation(self, nation, shards):
+            return ET.fromstring('<NATION id="oringrad"><FULLNAME>Oringrad</FULLNAME></NATION>')
+
+        def issues(self, nation):
+            return ET.fromstring(
+                '''
+                <NATION>
+                  <ISSUES>
+                    <ISSUE id="123">
+                      <TITLE>Robot Teachers</TITLE>
+                      <TEXT>Schools want robot teachers.</TEXT>
+                      <OPTION id="1">Ban them.</OPTION>
+                      <OPTION id="2">Regulate them.</OPTION>
+                    </ISSUE>
+                  </ISSUES>
+                </NATION>
+                '''
+            )
+
+        def answer_issue(self, nation, issue_id, option_id):
+            self.answer_calls.append((nation, issue_id, option_id))
+            return ET.fromstring('<NATION><ISSUE><OK>1</OK></ISSUE></NATION>')
+
+    class FakeGovernor:
+        advise_issue_ids: list[str] = []
+
+        def __init__(self, *, base_url=None, model=None, api_key=None):
+            self.base_url = base_url or 'http://localhost:1234/v1'
+            self.model = model or 'test-model'
+
+        def plan_issue_order(self, **kwargs):
+            raise AssertionError('single all-issues run should not ask AI to order')
+
+        def advise(self, *, live_issues, **kwargs):
+            issue = live_issues[0]
+            issue_id = str(issue['issue_id'])
+            FakeGovernor.advise_issue_ids.append(issue_id)
+            return {
+                **sample_recommendation(),
+                'issue_id': issue_id,
+                'option_id': '2',
+                'confidence': 0.95,
+                'charter_alignment_score': 95,
+                'red_line_triggered': False,
+                'model': self.model,
+            }
+
+    fake_ns = FakeNationStatesClient()
+    monkeypatch.setattr(
+        live.NationStatesClient,
+        'from_env',
+        classmethod(lambda cls, nation_config=None: fake_ns),
+    )
+    monkeypatch.setattr(live, 'LocalGovernor', FakeGovernor)
+
+    args = advise_args(tmp_path, profile_path=profile_path)
+    args.all_issues = True
+    args.auto = True
+    args.refresh_advice = False
+    args.flag_display = 'none'
+    args.parallel_requests = 4
+
+    run_advise(args)
+    output = capsys.readouterr().out
+
+    assert FakeGovernor.advise_issue_ids == ['123']
+    assert fake_ns.answer_calls == [('Oringrad', '123', '2')]
+    assert output.count('Cached deterministic fallback all-issues order plan ignored') == 1
+    assert 'AI step skipped: only one live issue is present for all-issues order.' in output
+    assert 'AI step skipped: reused cached recommendation.' in output
+    assert 'Cached advice for issue 123 cannot be reused' not in output
+    assert 'deterministic fallback was used for issue_selection' not in output
+
+
 def test_all_issues_parallel_requests_prefetch_missing_advice(
     tmp_path,
     monkeypatch,
@@ -1420,6 +1528,10 @@ def test_all_issues_parallel_prefetch_reports_cached_advice(
 
 def test_all_issues_progress_uses_stable_timer_layout() -> None:
     progress = live.make_all_issues_progress(Console(record=True))
+    transient_progress = live.make_all_issues_progress(
+        Console(record=True),
+        transient=True,
+    )
 
     assert [type(column).__name__ for column in progress.columns] == [
         'TextColumn',
@@ -1428,6 +1540,8 @@ def test_all_issues_progress_uses_stable_timer_layout() -> None:
         'TimeElapsedColumn',
     ]
     assert progress.live.refresh_per_second == live.ALL_ISSUES_PROGRESS_REFRESH_PER_SECOND
+    assert progress.live.transient is False
+    assert transient_progress.live.transient is True
 
 
 def test_auto_refreshes_unsafe_cached_advice_before_action(

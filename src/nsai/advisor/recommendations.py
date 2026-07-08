@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import textwrap
 import xml.etree.ElementTree as ET
 from typing import Any
 
 from nsai.advisor.cache import CachedAdvice, live_issue_by_id
 from nsai.advisor.client import NationStatesError
-from nsai.advisor.governor import maybe_float, wrapped
+from nsai.advisor.governor import maybe_float
 from nsai.advisor.safety import (
     ValidationResult,
     publication_mismatch_reasons,
@@ -17,6 +18,81 @@ from nsai.advisor.safety import (
 
 
 DISMISS_OPTION_ID = '-1'
+OUTPUT_WIDTH = 88
+FIELD_LABEL_WIDTH = 16
+
+
+def print_section_heading(title: str) -> None:
+    print()
+    print(title)
+    print('=' * OUTPUT_WIDTH)
+
+
+def print_subheading(title: str, *, indent: int = 2) -> None:
+    prefix = ' ' * indent
+    print(f'{prefix}{title}')
+    print(f'{prefix}{"-" * max(12, OUTPUT_WIDTH - indent)}')
+
+
+def print_field(
+    label: str,
+    value: Any,
+    *,
+    indent: int = 2,
+    label_width: int = FIELD_LABEL_WIDTH,
+) -> None:
+    text = str(value if value is not None else '').strip()
+    prefix = ' ' * indent
+    label_text = f'{prefix}{label + ":":<{label_width}} '
+    available_width = max(20, OUTPUT_WIDTH - len(label_text))
+    wrapped_lines = textwrap.wrap(text, width=available_width) or ['']
+    print(f'{label_text}{wrapped_lines[0]}')
+    continuation = ' ' * len(label_text)
+    for line in wrapped_lines[1:]:
+        print(f'{continuation}{line}')
+
+
+def print_wrapped_block(text: Any, *, indent: int = 4, width: int = OUTPUT_WIDTH) -> None:
+    value = str(text if text is not None else '').strip()
+    if not value:
+        return
+
+    prefix = ' ' * indent
+    paragraphs = value.splitlines()
+    printed = False
+    for paragraph in paragraphs:
+        paragraph = paragraph.strip()
+        if not paragraph:
+            if printed:
+                print()
+            continue
+
+        print(
+            textwrap.fill(
+                paragraph,
+                width=max(20, width),
+                initial_indent=prefix,
+                subsequent_indent=prefix,
+            )
+        )
+        printed = True
+
+
+def print_bullets(items: list[Any], *, indent: int = 4) -> None:
+    bullet_prefix = ' ' * indent + '- '
+    continuation = ' ' * (indent + 2)
+    for item in items:
+        text = str(item).strip()
+        if not text:
+            continue
+        print(
+            textwrap.fill(
+                text,
+                width=max(20, OUTPUT_WIDTH),
+                initial_indent=bullet_prefix,
+                subsequent_indent=continuation,
+            )
+        )
 
 
 def extract_live_issues(issues_root: ET.Element) -> list[dict[str, Any]]:
@@ -356,93 +432,88 @@ def is_cached_advice_usable(
 
 
 def print_live_issues(live_issues: list[dict[str, Any]]) -> None:
-    print()
-    print('Live NationStates Issues')
-    print('=' * 88)
+    print_section_heading('Live NationStates Issues')
 
     for issue in live_issues:
-        print()
-        print(f'Issue {issue["issue_id"]}: {issue.get("title", "")}')
-        print('-' * 88)
+        print_subheading(
+            f'Issue {issue["issue_id"]}: {issue.get("title", "")}',
+            indent=2,
+        )
 
         issue_text = issue.get('text') or ''
         if issue_text:
-            print(wrapped(issue_text))
+            print_wrapped_block(issue_text, indent=4)
             print()
 
         for option in issue.get('options', []):
-            print(f'  Option {option["option_id"]}:')
-            print(wrapped(option.get('text', ''), width=82))
+            print(f'    Option {option["option_id"]}')
+            print_wrapped_block(option.get('text', ''), indent=6)
             print()
 
 
 def print_recommendation(recommendation: dict[str, Any]) -> None:
-    print()
-    print('AI Governor Recommendation')
-    print('=' * 88)
-    print(f'Headline:        {recommendation.get("headline", "")}')
-    print(f'Action:          {recommendation_action(recommendation)}')
-    print(f'Issue ID:        {recommendation.get("issue_id", "")}')
+    print_section_heading('AI Governor Recommendation')
+    print_subheading('Decision')
+    print_field('Headline', recommendation.get('headline', ''))
+    print_field('Action', recommendation_action(recommendation))
+    print_field('Issue ID', recommendation.get('issue_id', ''))
     option_id = str(recommendation.get('option_id', '')).strip()
-    print(f'Option ID:       {option_id}')
-    print(f'Confidence:      {recommendation.get("confidence", "")}')
-    print(f'Alignment Score: {recommendation.get("charter_alignment_score", "")}')
-    print(f'Red Line Hit:    {recommendation.get("red_line_triggered", "")}')
-    print(f'Model:           {recommendation.get("model", "")}')
-    print()
+    print_field('Option ID', option_id)
+    print_field('Confidence', recommendation.get('confidence', ''))
+    print_field('Alignment Score', recommendation.get('charter_alignment_score', ''))
+    print_field('Red Line Hit', recommendation.get('red_line_triggered', ''))
+    print_field('Model', recommendation.get('model', ''))
 
     issue_summary = recommendation.get('issue_summary', '')
     if issue_summary:
-        print('Issue summary:')
-        print(wrapped(str(issue_summary)))
         print()
+        print_subheading('Issue')
+        print_field('Summary', issue_summary)
+
+    why_first = recommendation.get('why_this_issue_first', '')
+    reasoning = recommendation.get('reasoning', '')
+    if why_first or reasoning:
+        print()
+        print_subheading('Reasoning')
+        if why_first:
+            print_field('Priority', why_first)
+        if reasoning:
+            print_field('Rationale', reasoning)
 
     option_summaries = recommendation.get('option_summaries') or []
     if option_summaries:
-        print('Option summaries:')
+        print()
+        print_subheading('Options')
         for item in option_summaries:
             if isinstance(item, dict):
                 option = item.get('option_id', '')
                 summary = item.get('summary', '')
                 expected = item.get('expected_effect', '')
-                print(f' - Option {option}: {summary}')
+                print(f'    Option {option}')
+                print_field('Summary', summary, indent=6)
                 if expected:
-                    print(f'   Expected effect: {expected}')
+                    print_field('Effect', expected, indent=6)
             else:
-                print(f' - {item}')
-        print()
-
-    why_first = recommendation.get('why_this_issue_first', '')
-    if why_first:
-        print('Why this issue first:')
-        print(wrapped(why_first))
-        print()
-
-    reasoning = recommendation.get('reasoning', '')
-    if reasoning:
-        print('Reasoning:')
-        print(wrapped(reasoning))
-        print()
+                print_bullets([item], indent=4)
 
     tradeoffs = recommendation.get('expected_tradeoffs') or []
-    if tradeoffs:
-        print('Expected tradeoffs:')
-        for item in tradeoffs:
-            print(f' - {item}')
-
     red_line_notes = recommendation.get('red_line_notes') or []
+    blockers = recommendation.get('do_not_enact_if') or []
+    if tradeoffs or red_line_notes or blockers:
+        print()
+        print_subheading('Guardrails')
+
+    if tradeoffs:
+        print('    Expected tradeoffs')
+        print_bullets(tradeoffs, indent=6)
     if red_line_notes:
         print()
-        print('Red-line notes:')
-        for item in red_line_notes:
-            print(f' - {item}')
-
-    blockers = recommendation.get('do_not_enact_if') or []
+        print('    Red-line notes')
+        print_bullets(red_line_notes, indent=6)
     if blockers:
         print()
-        print('Do not enact if:')
-        for item in blockers:
-            print(f' - {item}')
+        print('    Do not enact if')
+        print_bullets(blockers, indent=6)
 
     print_publication_drafts(recommendation)
 
@@ -450,31 +521,31 @@ def print_recommendation(recommendation: dict[str, Any]) -> None:
 def print_publication_drafts(recommendation: dict[str, Any]) -> None:
     dispatch = recommendation.get('dispatch_draft')
     if isinstance(dispatch, dict) and dispatch.get('requested'):
+        print_section_heading('Dispatch Draft')
+        print_subheading('Metadata')
+        print_field('Title', dispatch.get('title', ''))
+        print_field('Category', dispatch.get('category_hint', ''))
+        print_field('Subcategory', dispatch.get('subcategory_hint', ''))
         print()
-        print('Dispatch draft')
-        print('=' * 88)
-        print(f'Title:       {dispatch.get("title", "")}')
-        print(f'Category:    {dispatch.get("category_hint", "")}')
-        print(f'Subcategory: {dispatch.get("subcategory_hint", "")}')
-        print()
-        print(wrapped(dispatch.get('text', '')))
+        print_subheading('Text')
+        print_wrapped_block(dispatch.get('text', ''), indent=4)
 
     factbook = recommendation.get('factbook_draft')
     if isinstance(factbook, dict) and factbook.get('requested'):
-        print()
-        print('Factbook draft')
-        print('=' * 88)
-        print(f'Pertinent:   {factbook.get("pertinent", False)}')
+        print_section_heading('Factbook Draft')
+        print_subheading('Metadata')
+        print_field('Pertinent', factbook.get('pertinent', False))
         reason = str(factbook.get('reason', '')).strip()
         if reason:
-            print(f'Reason:      {reason}')
+            print_field('Reason', reason)
 
         if factbook.get('pertinent'):
-            print(f'Title:       {factbook.get("title", "")}')
-            print(f'Category:    {factbook.get("category_hint", "")}')
-            print(f'Subcategory: {factbook.get("subcategory_hint", "")}')
+            print_field('Title', factbook.get('title', ''))
+            print_field('Category', factbook.get('category_hint', ''))
+            print_field('Subcategory', factbook.get('subcategory_hint', ''))
             print()
-            print(wrapped(factbook.get('text', '')))
+            print_subheading('Text')
+            print_wrapped_block(factbook.get('text', ''), indent=4)
 
 
 def get_profile_min_confidence(profile: dict[str, Any] | None) -> float:

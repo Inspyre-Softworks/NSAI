@@ -81,9 +81,14 @@ from nsai.advisor.recommendations import (  # noqa: F401
     is_cached_advice_usable,
     is_dismiss_recommendation,
     is_fallback_recommendation,
+    print_bullets,
+    print_field,
     print_live_issues,
     print_publication_drafts,
     print_recommendation,
+    print_section_heading,
+    print_subheading,
+    print_wrapped_block,
     recommendation_action,
     should_auto_enact,
     should_manual_enact,
@@ -302,15 +307,18 @@ def print_decision_summary(
     else:
         resolution = 'Advisor-only decision; no NationStates action was submitted.'
 
-    print()
-    print('Decision Summary')
-    print('=' * 88)
-    print(f'Issue:      {issue_title} ({issue_id})')
-    print(f'Decision:   {action} option {option_id} via {action_mode}')
-    print(f'Resolution: {resolution}')
-    print(f'Reasoning:  {recommendation_reason_summary(recommendation)}')
-    for reason in unique_reasons(action_reasons + auto_block_reasons):
-        print(f' - {reason}')
+    print_section_heading('Decision Summary')
+    print_subheading('Outcome')
+    print_field('Issue', f'{issue_title} ({issue_id})')
+    print_field('Decision', f'{action} option {option_id} via {action_mode}')
+    print_field('Resolution', resolution)
+    print_field('Reasoning', recommendation_reason_summary(recommendation))
+
+    reasons = unique_reasons(action_reasons + auto_block_reasons)
+    if reasons:
+        print()
+        print_subheading('Notes')
+        print_bullets(reasons)
 
 
 def normalize_issue_order_plan(
@@ -597,22 +605,25 @@ def run_all_issues(
         raise SystemExit('No live issues with options found for all-issues mode.')
 
     issue_by_id = {str(issue['issue_id']): issue for issue in live_issues}
-    print()
-    print('All-Issues Plan')
-    print('=' * 88)
+    print_section_heading('All-Issues Plan')
+    print_subheading('Order')
     for index, issue_id in enumerate(ordered_issue_ids, start=1):
         issue = issue_by_id.get(issue_id) or {}
         title = compact_summary_text(issue.get('title')) or 'Untitled issue'
         reason = reasons.get(issue_id) or 'No ordering reason was provided.'
-        print(f'{index}. {title} ({issue_id})')
-        print(f'   {reason}')
+        print(f'  {index}. {title} ({issue_id})')
+        print_field('Reason', reason, indent=5, label_width=10)
 
     console = Console()
     plan_source = str(plan.get('source') or 'ai')
     plan_fallback_used = bool(plan.get('fallback_issue_order_used')) or plan_source == 'fallback'
 
     print()
-    print('Press Escape to cancel the all-issues run before the next action is submitted.')
+    print_subheading('Cancellation')
+    print_wrapped_block(
+        'Press Escape to cancel the all-issues run before the next action is submitted.',
+        indent=4,
+    )
 
     prefetch_issue_advice(
         args=args,
@@ -682,8 +693,8 @@ def run_all_issues(
                 completed += 1
                 progress.update(overall, completed=completed)
 
-    print()
-    print(f'All-issues run complete: processed {completed}/{len(ordered_issue_ids)} issue(s).')
+    print_section_heading('All-Issues Complete')
+    print_field('Processed', f'{completed}/{len(ordered_issue_ids)} issue(s)')
 
 
 def run_advise(args: argparse.Namespace) -> None:
@@ -1254,26 +1265,28 @@ def run_advise(args: argparse.Namespace) -> None:
 
     action_reasons = unique_reasons(action_reasons)
 
-    print()
-    print('Action Decision')
-    print('=' * 88)
+    print_section_heading('Action Decision')
+    print_subheading('Mode')
 
     if should_enact:
-        print(f'Will apply recommendation via: {action_mode}')
+        print_field('Decision', f'Will apply recommendation via {action_mode}')
     else:
-        print('Advisor mode only. No issue action was submitted.')
+        print_field('Decision', 'Advisor mode only. No issue action was submitted.')
 
-    for reason in action_reasons:
-        print(f' - {reason}')
+    if action_reasons:
+        print()
+        print_subheading('Reasons')
+        print_bullets(action_reasons)
 
     if auto_block_reasons and not should_enact:
+        print_section_heading('AUTO ACTION BLOCKED')
+        print_bullets(auto_block_reasons)
         print()
-        print('AUTO ACTION BLOCKED')
-        print('=' * 88)
-        for reason in auto_block_reasons:
-            print(f' - {reason}')
-        print('Final decision: requires_review.')
-        print('No NationStates issue action or publication will be submitted.')
+        print_field('Final decision', 'requires_review')
+        print_wrapped_block(
+            'No NationStates issue action or publication will be submitted.',
+            indent=2,
+        )
 
     result_xml = None
     publication_results: list[dict[str, Any]] = []
@@ -1293,23 +1306,23 @@ def run_advise(args: argparse.Namespace) -> None:
             result_xml=result_xml,
         )
 
-        print()
         if recommendation_action(recommendation) == 'dismiss':
-            print('Issue dismissed.')
+            print_section_heading('Issue Dismissed')
         else:
-            print('Issue enacted.')
-        print('=' * 88)
-        print(result_xml)
-        print(
-            f'Cached enactment outcome: {len(effects)} effect record(s), '
-            f'{len(headlines)} headline(s).'
-        )
+            print_section_heading('Issue Enacted')
+        print_subheading('NationStates Response')
+        print_wrapped_block(result_xml, indent=4)
+        print()
+        print_subheading('Cached Outcome')
+        print_field('Effects', f'{len(effects)} effect record(s)')
+        print_field('Headlines', f'{len(headlines)} headline(s)')
 
         if result_error:
-            print()
-            print(
+            print_section_heading('Publication Skipped')
+            print_wrapped_block(
                 'Publication pages were not posted because NationStates returned '
-                f'an issue-action error: {result_error}'
+                f'an issue-action error: {result_error}',
+                indent=2,
             )
         else:
             action_applied = True
@@ -1325,33 +1338,48 @@ def run_advise(args: argparse.Namespace) -> None:
             )
             print_publication_results(publication_results)
     else:
-        print()
         if is_fallback_recommendation(recommendation):
-            print(
+            print_section_heading('Next Steps')
+            print_wrapped_block(
                 'Fallback recommendations are review-only; use --refresh-advice '
-                'with AI enabled before enacting.'
+                'with AI enabled before enacting.',
+                indent=2,
             )
         elif args.enact:
-            print('Manual enactment was requested, but the guardrails above blocked it.')
+            print_section_heading('Next Steps')
+            print_wrapped_block(
+                'Manual enactment was requested, but the guardrails above blocked it.',
+                indent=2,
+            )
         else:
-            print('To manually apply this exact recommendation, run again with --enact.')
+            print_section_heading('Next Steps')
+            print_wrapped_block(
+                'To manually apply this exact recommendation, run again with --enact.',
+                indent=2,
+            )
 
         if args.auto:
-            print(
+            print_wrapped_block(
                 'Auto mode was requested, but automatic action was blocked by '
-                'the guardrails above.'
+                'the guardrails above.',
+                indent=2,
             )
         elif profile:
-            print('To allow profile-controlled autonomy, run with --auto.')
+            print_wrapped_block(
+                'To allow profile-controlled autonomy, run with --auto.',
+                indent=2,
+            )
             if save_opts:
-                print(
+                print_wrapped_block(
                     '--save-opts does not persist --auto; pass --auto on each '
-                    'run that should allow automatic action.'
+                    'run that should allow automatic action.',
+                    indent=2,
                 )
         if draft_dispatch or draft_factbook:
-            print(
+            print_wrapped_block(
                 'Publication drafts were not posted because no issue action was '
-                'submitted.'
+                'submitted.',
+                indent=2,
             )
 
     if decision_summary:

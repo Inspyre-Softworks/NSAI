@@ -29,6 +29,7 @@ from nsai.advisor.recommendations import (
     extract_live_issues,
     fallback_recommendation,
     is_dismiss_recommendation,
+    print_recommendation,
     recommendation_action,
     should_auto_enact,
     should_manual_enact,
@@ -104,6 +105,30 @@ def sample_recommendation() -> dict[str, object]:
         'red_line_triggered': False,
         'do_not_enact_if': [],
     }
+
+
+def test_recommendation_output_uses_structured_sections(capsys) -> None:
+    recommendation = {
+        **sample_recommendation(),
+        'why_this_issue_first': 'Education policy has immediate effects on schools.',
+        'reasoning': 'Regulation balances innovation with public oversight.',
+        'expected_tradeoffs': ['Schools gain oversight but implementation slows.'],
+        'red_line_notes': ['No red lines are triggered.'],
+        'do_not_enact_if': ['Do not enact if the education ministry objects.'],
+    }
+
+    print_recommendation(recommendation)
+    output = capsys.readouterr().out
+
+    assert 'AI Governor Recommendation' in output
+    assert '  Decision' in output
+    assert '  Issue' in output
+    assert '  Reasoning' in output
+    assert '  Options' in output
+    assert '  Guardrails' in output
+    assert '    Option 2' in output
+    assert '      Effect:' in output
+    assert '      - Schools gain oversight but implementation slows.' in output
 
 
 def write_auto_profile(tmp_path, *, minimum_confidence: float = 0.8):

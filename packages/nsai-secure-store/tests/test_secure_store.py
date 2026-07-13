@@ -6,7 +6,7 @@ from types import ModuleType
 
 import pytest
 
-import nsai.secure_store as secure_store
+import nsai_secure_store as secure_store
 
 
 def _install_fake_winrt_apartment(

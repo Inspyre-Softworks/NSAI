@@ -1,0 +1,22 @@
+[project]
+name = 'nsai-secure-store'
+version = '0.1.0'
+description = 'OS-backed secure secret storage for NSAI, including Windows Hello desktop verification.'
+authors = [{ name = 'Taylor B. | Inspyre-Softworks.' }]
+readme = 'README.md'
+requires-python = '>=3.11,<4.0'
+dependencies = [
+    'keyring>=25.0.0,<26.0.0',
+    "winrt-windows-security-credentials-ui (>=3.2.1,<4.0.0) ; platform_system == \"Windows\"",
+    "winrt-windows-foundation (>=3.2.1,<4.0.0) ; platform_system == \"Windows\"",
+]
+
+[tool.poetry]
+packages = [{ include = 'nsai_secure_store', from = 'src' }]
+
+[tool.poetry.group.dev.dependencies]
+pytest = '>=8.0.0,<9.0.0'
+
+[build-system]
+requires = ['poetry-core>=2.0.0,<3.0.0']
+build-backend = 'poetry.core.masonry.api'

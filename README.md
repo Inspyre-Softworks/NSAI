@@ -108,6 +108,12 @@ The preview command renders the profile with Rich tables and panels instead of d
 
 Advisor-only mode is the default. Nothing is enacted unless you explicitly pass `--enact` or `--auto`.
 
+Check current live issues without contacting the local AI, updating advice caches, writing an audit log, or submitting any action:
+
+```powershell
+poetry run nsai check issues --nation Oringrad
+```
+
 ```powershell
 poetry run nsai advise --profile .\oringrad_governance_profile.json --show-issues
 ```
@@ -146,7 +152,9 @@ Use deterministic fallback logic without local AI:
 poetry run nsai advise --nation Oringrad --no-ai
 ```
 
-By default, the advisor stores issue choices and per-issue advice in a SQLite cache under the NSAI config directory. If the same live issue IDs are present on a later run, NSAI reuses the saved "most important issue" choice. If the chosen issue already has saved advice, NSAI reuses that recommendation instead of contacting the local AI again. If a new issue ID appears, the issue choice is recalculated, but saved advice for any selected issue ID is still reused.
+By default, the advisor stores issue choices, all-issue order plans, and per-issue advice in a SQLite cache under the NSAI config directory. If the same live issue IDs are present on a later run, NSAI reuses the saved "most important issue" choice. If `--all-issues` is used, NSAI asks the advisor to sort every live issue into a resolution order, caches that order, and then processes each issue in turn with progress bars. Use `--no-issue-ordering` or `--issue-order arrival` to skip the AI ordering step and keep the NationStates API issue order; use `--issue-id-order` or `--issue-order id` to process issues by ID number. If a later run has only the unresolved remainder from a cached order, NSAI reuses the larger cached plan and filters out issues that are no longer live. Press Escape during an all-issues run to cancel before the next issue action is submitted. If the chosen issue already has saved advice, NSAI reuses that recommendation instead of contacting the local AI again. If a new issue ID appears, the issue choice or order plan is recalculated, but saved advice for any selected issue ID is still reused. Pass `--parallel-requests N` with `--all-issues` to prefetch missing local-model recommendations with up to `N` parallel requests; NationStates issue actions are still applied sequentially in the cached order. Pass `--trace-api` to print redacted NationStates and local-model API requests and responses.
+
+Each decision prints a short resolution and reasoning summary by default. Disable that extra summary with `--no-decision-summary`.
 
 Force a fresh model pass for the current issue set:
 

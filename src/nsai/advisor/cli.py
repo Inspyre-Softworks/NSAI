@@ -74,6 +74,7 @@ from nsai.advisor.safety import (
     validate_auto_action,
     validate_recommendation_consistency,
 )
+from nsai.help import NSAIArgumentParser
 from nsai.nations import (
     NationConfig,
     advice_cache_path,
@@ -103,6 +104,7 @@ DEFAULT_STRATEGY = (
 )
 DEFAULT_AUDIT_LOG = 'ns_governor_audit.jsonl'
 DEFAULT_PUBLICATION_COOLDOWN_SECONDS = 300.0
+DEFAULT_ISSUE_COOLDOWN_SECONDS = 5.0
 FLAG_DISPLAY_MODES = {'ascii', 'banner', 'none'}
 FLAG_ASCII_WIDTH = 42
 FLAG_ASCII_RAMP = '@%#*+=-:. '
@@ -792,6 +794,89 @@ def add_advise_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
     parser.add_argument(
+        '--all-issues',
+        '--all',
+        dest='all_issues',
+        action='store_true',
+        help=(
+            'Process every live issue in a cached advisor-chosen order. '
+            'Press Escape to cancel between issues or before action submission.'
+        ),
+    )
+
+    parser.add_argument(
+        '--issue-order',
+        choices=('ai', 'arrival', 'id'),
+        default='ai',
+        help=(
+            'For --all-issues, choose how to order issues: ai asks the local model, '
+            'arrival keeps the NationStates API order, and id sorts by issue ID.'
+        ),
+    )
+
+    parser.add_argument(
+        '--no-issue-ordering',
+        dest='issue_order',
+        action='store_const',
+        const='arrival',
+        help='Shortcut for --issue-order arrival.',
+    )
+
+    parser.add_argument(
+        '--issue-id-order',
+        dest='issue_order',
+        action='store_const',
+        const='id',
+        help='Shortcut for --issue-order id.',
+    )
+
+    parser.add_argument(
+        '--parallel-requests',
+        type=int,
+        default=1,
+        metavar='N',
+        help=(
+            'For --all-issues, prefetch missing local-model recommendations '
+            'with up to N parallel requests before applying issue actions in order.'
+        ),
+    )
+
+    parser.add_argument(
+        '--trace-api',
+        action='store_true',
+        help=(
+            'Print redacted NationStates and local-model API requests and responses.'
+        ),
+    )
+
+    parser.add_argument(
+        '--publication-cooldown-seconds',
+        type=float,
+        default=DEFAULT_PUBLICATION_COOLDOWN_SECONDS,
+        help=(
+            'Seconds to wait between live advisor publication posts for the same '
+            f'nation. Default: {DEFAULT_PUBLICATION_COOLDOWN_SECONDS:.0f}.'
+        ),
+    )
+
+    parser.add_argument(
+        '--issue-cooldown-seconds',
+        type=float,
+        default=DEFAULT_ISSUE_COOLDOWN_SECONDS,
+        help=(
+            'Seconds to wait between live issue actions in --all-issues mode. '
+            f'Default: {DEFAULT_ISSUE_COOLDOWN_SECONDS:.0f}.'
+        ),
+    )
+
+    parser.add_argument(
+        '--decision-summary',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Print a concise resolution and reasoning summary for each decision.',
+    )
+
+    parser.add_argument(
         '--draft-dispatch',
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -925,7 +1010,7 @@ def add_publications_arguments(subparsers: argparse._SubParsersAction) -> None:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = NSAIArgumentParser(
         description='AI-assisted NationStates live governor/advisor.'
     )
     add_advise_arguments(parser)

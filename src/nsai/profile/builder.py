@@ -57,6 +57,7 @@ from nsai.profile.storage import (  # noqa: F401
     make_backup,
     write_profile_json,
 )
+from nsai.help import NSAIArgumentParser
 
 
 TEXTUAL_FEATURES_ENV = 'TEXTUAL'
@@ -749,7 +750,7 @@ def print_ai_generated_preview(ai_generated: dict[str, Any], console: Console) -
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = NSAIArgumentParser(
         description='Build and enrich NationStates AI governor profiles.'
     )
     add_textual_dev_argument(parser, default=argparse.SUPPRESS)

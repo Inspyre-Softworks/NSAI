@@ -1314,6 +1314,146 @@ def test_all_issues_reuses_cached_fallback_order_plan_when_ai_available(
     assert 'Cached deterministic fallback all-issues order plan ignored' not in output
 
 
+def test_ai_ordering_ignores_cached_arrival_order_plan(
+    tmp_path,
+    capsys,
+) -> None:
+    cache = live.AdviceCache(tmp_path / 'advice.sqlite3')
+    issues = [
+        {
+            'issue_id': '456',
+            'title': 'Orbital Farms',
+            'text': 'Farmers want orbital hydroponics grants.',
+            'options': [{'option_id': '1', 'text': 'Fund them.'}],
+        },
+        {
+            'issue_id': '123',
+            'title': 'Robot Teachers',
+            'text': 'Schools want robot teachers.',
+            'options': [{'option_id': '1', 'text': 'Regulate them.'}],
+        },
+    ]
+    cache.save_issue_plan(
+        nation='Oringrad',
+        live_issues=issues,
+        ordered_issue_ids=['456', '123'],
+        reasons={
+            '456': 'AI issue ordering was disabled.',
+            '123': 'AI issue ordering was disabled.',
+        },
+        source='arrival',
+        token_usage={},
+    )
+
+    class FakeGovernor:
+        plan_calls = 0
+
+        def plan_issue_order(self, **kwargs):
+            FakeGovernor.plan_calls += 1
+            return {
+                'ordered_issue_ids': ['123', '456'],
+                'reasons': {
+                    '123': 'Education should be reviewed first.',
+                    '456': 'Food security can follow.',
+                },
+                'model': 'test-model',
+                'token_usage': {'total_tokens': 10},
+            }
+
+    args = SimpleNamespace(issue_order='ai', refresh_advice=False, no_ai=False)
+
+    plan = live.get_or_create_issue_order_plan(
+        args=args,
+        cache=cache,
+        nation='Oringrad',
+        live_issues=issues,
+        strategy='keep things stable',
+        profile=None,
+        nation_snapshot_xml='<NATION />',
+        get_governor=FakeGovernor,
+    )
+    output = capsys.readouterr().out
+
+    assert FakeGovernor.plan_calls == 1
+    assert plan['ordered_issue_ids'] == ['123', '456']
+    assert plan['source'] == 'ai'
+    assert 'Cached non-AI all-issues order plan ignored' in output
+
+
+def test_ai_ordering_ignores_cached_covering_id_order_plan(
+    tmp_path,
+    capsys,
+) -> None:
+    cache = live.AdviceCache(tmp_path / 'advice.sqlite3')
+    previous_issues = [
+        {
+            'issue_id': '789',
+            'title': 'Already Resolved',
+            'text': '',
+            'options': [{'option_id': '1', 'text': 'Act.'}],
+        },
+        {
+            'issue_id': '456',
+            'title': 'Orbital Farms',
+            'text': 'Farmers want orbital hydroponics grants.',
+            'options': [{'option_id': '1', 'text': 'Fund them.'}],
+        },
+        {
+            'issue_id': '123',
+            'title': 'Robot Teachers',
+            'text': 'Schools want robot teachers.',
+            'options': [{'option_id': '1', 'text': 'Regulate them.'}],
+        },
+    ]
+    current_issues = previous_issues[1:]
+    cache.save_issue_plan(
+        nation='Oringrad',
+        live_issues=previous_issues,
+        ordered_issue_ids=['123', '456', '789'],
+        reasons={
+            '123': 'Issue ID ordering was requested.',
+            '456': 'Issue ID ordering was requested.',
+            '789': 'Issue ID ordering was requested.',
+        },
+        source='id',
+        token_usage={},
+    )
+
+    class FakeGovernor:
+        plan_calls = 0
+
+        def plan_issue_order(self, **kwargs):
+            FakeGovernor.plan_calls += 1
+            return {
+                'ordered_issue_ids': ['456', '123'],
+                'reasons': {
+                    '456': 'Food security should be reviewed first.',
+                    '123': 'Education can follow.',
+                },
+                'model': 'test-model',
+                'token_usage': {'total_tokens': 11},
+            }
+
+    args = SimpleNamespace(issue_order='ai', refresh_advice=False, no_ai=False)
+
+    plan = live.get_or_create_issue_order_plan(
+        args=args,
+        cache=cache,
+        nation='Oringrad',
+        live_issues=current_issues,
+        strategy='keep things stable',
+        profile=None,
+        nation_snapshot_xml='<NATION />',
+        get_governor=FakeGovernor,
+    )
+    output = capsys.readouterr().out
+
+    assert FakeGovernor.plan_calls == 1
+    assert plan['ordered_issue_ids'] == ['456', '123']
+    assert plan['source'] == 'ai'
+    assert 'Cached non-AI all-issues order plan ignored' in output
+
+
 def test_all_issues_can_skip_ai_ordering_with_arrival_order(
     tmp_path,
     monkeypatch,
@@ -1990,6 +2130,40 @@ def test_parallel_prefetch_failure_does_not_cache_fallback_advice(
     assert seen_kwargs[0]['fallback_on_failure'] is False
     assert cache.get_advice('Oringrad', '123') is None
     assert 'Sequential all-issues processing will retry that issue.' in console.export_text()
+
+
+def test_escape_monitor_starts_posix_watcher(monkeypatch) -> None:
+    started: dict[str, object] = {}
+
+    class FakeThread:
+        def __init__(self, *, target, name, daemon):
+            started['target'] = target
+            started['name'] = name
+            started['daemon'] = daemon
+
+        def start(self):
+            started['started'] = True
+
+        def join(self, *, timeout=None):
+            started['join_timeout'] = timeout
+
+    monkeypatch.setattr(live.os, 'name', 'posix')
+    monkeypatch.setattr(
+        live.sys,
+        'stdin',
+        SimpleNamespace(isatty=lambda: True),
+    )
+    monkeypatch.setattr(live.threading, 'Thread', FakeThread)
+
+    with live.EscapeCancelMonitor() as monitor:
+        assert started['started'] is True
+        assert started['name'] == 'NSAIAllIssuesEscapeMonitor'
+        assert started['daemon'] is True
+        target = started['target']
+        assert target.__self__ is monitor
+        assert target.__name__ == '_watch_posix_escape'
+
+    assert started['join_timeout'] == 0.2
 
 
 def test_all_issues_escape_monitor_is_active_during_prefetch(

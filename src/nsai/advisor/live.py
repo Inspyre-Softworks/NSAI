@@ -28,7 +28,12 @@ from rich.console import Console
 from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn
 from rich.table import Column
 
-from nsai.advisor.cache import AdviceCache, CachedAdvice, live_issue_by_id  # noqa: F401
+from nsai.advisor.cache import (  # noqa: F401
+    AdviceCache,
+    CachedAdvice,
+    CachedIssuePlan,
+    live_issue_by_id,
+)
 from nsai.advisor.client import (  # noqa: F401
     NS_API_URL,
     NationStatesClient,
@@ -176,6 +181,7 @@ ALL_ISSUES_PROGRESS_DESCRIPTION_WIDTH = 56
 ALL_ISSUES_PROGRESS_BAR_WIDTH = 30
 ALL_ISSUES_PROGRESS_REFRESH_PER_SECOND = 1.0
 ISSUE_ORDER_MODES = {'ai', 'arrival', 'id'}
+NON_AI_ISSUE_ORDER_PLAN_SOURCES = {'arrival', 'id'}
 PUBLICATION_COOLDOWN_SKIP_MESSAGE = (
     'NationStates publication cooldown is active; skipping remaining publication '
     'drafts for this run.'
@@ -196,11 +202,16 @@ class EscapeCancelMonitor:
         self._thread: threading.Thread | None = None
 
     def __enter__(self) -> 'EscapeCancelMonitor':
-        if not self.enabled or not sys.stdin.isatty() or os.name != 'nt':
+        if not self.enabled or not sys.stdin.isatty():
             return self
 
+        target = (
+            self._watch_windows_escape
+            if os.name == 'nt'
+            else self._watch_posix_escape
+        )
         self._thread = threading.Thread(
-            target=self._watch_windows_escape,
+            target=target,
             name='NSAIAllIssuesEscapeMonitor',
             daemon=True,
         )
@@ -209,6 +220,8 @@ class EscapeCancelMonitor:
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
         self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=0.2)
 
     def _watch_windows_escape(self) -> None:
         try:
@@ -224,6 +237,36 @@ class EscapeCancelMonitor:
             except OSError:
                 return
             time.sleep(0.05)
+
+    def _watch_posix_escape(self) -> None:
+        try:
+            import select
+            import termios
+            import tty
+        except ImportError:
+            return
+
+        try:
+            file_descriptor = sys.stdin.fileno()
+            original_attrs = termios.tcgetattr(file_descriptor)
+        except (OSError, ValueError, termios.error):
+            return
+
+        try:
+            tty.setcbreak(file_descriptor)
+            while not self._stop.is_set() and not self._cancelled.is_set():
+                try:
+                    readable, _, _ = select.select([file_descriptor], [], [], 0.05)
+                    if readable and os.read(file_descriptor, 1) == b'\x1b':
+                        self._cancelled.set()
+                        return
+                except (OSError, ValueError):
+                    return
+        finally:
+            try:
+                termios.tcsetattr(file_descriptor, termios.TCSADRAIN, original_attrs)
+            except (OSError, ValueError, termios.error):
+                return
 
     def cancel_requested(self) -> bool:
         return self._cancelled.is_set()
@@ -394,6 +437,31 @@ def deterministic_issue_order_plan(
         'model': model,
         'fallback_issue_order_used': False,
     }
+
+
+def issue_order_plan_source(cached_plan: CachedIssuePlan) -> str:
+    return str(cached_plan.source or '').strip().lower()
+
+
+def cached_issue_order_plan_is_reusable_for_ai(
+    cached_plan: CachedIssuePlan,
+) -> bool:
+    return issue_order_plan_source(cached_plan) not in NON_AI_ISSUE_ORDER_PLAN_SOURCES
+
+
+def note_ignored_non_ai_cached_issue_order_plan(
+    cached_plan: CachedIssuePlan,
+    ignored_sources: set[str],
+) -> None:
+    source = issue_order_plan_source(cached_plan)
+    if source in ignored_sources:
+        return
+
+    ignored_sources.add(source)
+    print(
+        'Cached non-AI all-issues order plan ignored because '
+        f'--issue-order ai is active (source: {source}).'
+    )
 
 
 def create_local_governor(
@@ -616,46 +684,58 @@ def get_or_create_issue_order_plan(
         return plan
 
     if not args.refresh_advice:
+        ignored_cached_order_sources: set[str] = set()
         cached_plan = cache.get_issue_plan(nation, live_issues)
         if cached_plan:
-            live_issue_ids = {
-                str(issue['issue_id'])
-                for issue in live_issues
-                if issue.get('options')
-            }
-            cached_issue_ids = set(cached_plan.ordered_issue_ids)
-            if cached_issue_ids == live_issue_ids:
-                print('AI step skipped: reused cached all-issues order plan.')
-                return {
-                    'ordered_issue_ids': cached_plan.ordered_issue_ids,
-                    'reasons': cached_plan.reasons,
-                    'source': cached_plan.source or 'cache',
-                    'token_usage': cached_plan.token_usage,
-                    'from_cache': True,
-                    'fallback_issue_order_used': cached_plan.source == 'fallback',
+            if cached_issue_order_plan_is_reusable_for_ai(cached_plan):
+                live_issue_ids = {
+                    str(issue['issue_id'])
+                    for issue in live_issues
+                    if issue.get('options')
                 }
+                cached_issue_ids = set(cached_plan.ordered_issue_ids)
+                if cached_issue_ids == live_issue_ids:
+                    print('AI step skipped: reused cached all-issues order plan.')
+                    return {
+                        'ordered_issue_ids': cached_plan.ordered_issue_ids,
+                        'reasons': cached_plan.reasons,
+                        'source': cached_plan.source or 'cache',
+                        'token_usage': cached_plan.token_usage,
+                        'from_cache': True,
+                        'fallback_issue_order_used': cached_plan.source == 'fallback',
+                    }
+            else:
+                note_ignored_non_ai_cached_issue_order_plan(
+                    cached_plan,
+                    ignored_cached_order_sources,
+                )
         cached_covering_plan = cache.get_covering_issue_plan(nation, live_issues)
         if cached_covering_plan:
-            ordered_issue_ids, reasons = normalize_issue_order_plan(
-                {
-                    'ordered_issue_ids': cached_covering_plan.ordered_issue_ids,
-                    'reasons': cached_covering_plan.reasons,
-                },
-                live_issues,
+            if cached_issue_order_plan_is_reusable_for_ai(cached_covering_plan):
+                ordered_issue_ids, reasons = normalize_issue_order_plan(
+                    {
+                        'ordered_issue_ids': cached_covering_plan.ordered_issue_ids,
+                        'reasons': cached_covering_plan.reasons,
+                    },
+                    live_issues,
+                )
+                print(
+                    'AI step skipped: reused cached all-issues order plan '
+                    'for remaining live issues.'
+                )
+                return {
+                    'ordered_issue_ids': ordered_issue_ids,
+                    'reasons': reasons,
+                    'source': cached_covering_plan.source or 'cache',
+                    'token_usage': cached_covering_plan.token_usage,
+                    'from_cache': True,
+                    'from_covering_cache': True,
+                    'fallback_issue_order_used': cached_covering_plan.source == 'fallback',
+                }
+            note_ignored_non_ai_cached_issue_order_plan(
+                cached_covering_plan,
+                ignored_cached_order_sources,
             )
-            print(
-                'AI step skipped: reused cached all-issues order plan '
-                'for remaining live issues.'
-            )
-            return {
-                'ordered_issue_ids': ordered_issue_ids,
-                'reasons': reasons,
-                'source': cached_covering_plan.source or 'cache',
-                'token_usage': cached_covering_plan.token_usage,
-                'from_cache': True,
-                'from_covering_cache': True,
-                'fallback_issue_order_used': cached_covering_plan.source == 'fallback',
-            }
 
     if len(processable_issues) == 1:
         issue_id = str(processable_issues[0]['issue_id'])

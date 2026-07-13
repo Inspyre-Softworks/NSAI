@@ -974,9 +974,9 @@ def run_all_issues(
     plan_source = str(plan.get('source') or 'ai')
 
     print()
-    print_subheading('Cancellation')
     print_wrapped_block(
-        'Press Escape to cancel prefetching or stop before the next issue action is submitted.',
+        'Press Escape to cancel prefetching or stop before the next issue action is submitted '
+        '(Windows console only). Otherwise use Ctrl+C to interrupt.',
         indent=4,
     )
 

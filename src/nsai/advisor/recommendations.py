@@ -267,6 +267,7 @@ def fallback_recommendation(
                 'audit_summary': (
                     f'Fallback selected dismissal for issue {issue["issue_id"]}.'
                 ),
+                'reasoning_matches_action': True,
                 'model': 'fallback',
                 'fallback_recommendation_used': True,
                 'requires_review': True,

@@ -715,6 +715,12 @@ Rules:
 - If you cannot give the action a meaningful alignment score above 0, lower
   confidence or dismiss instead of forcing enactment.
 - Keep reasoning, expected_tradeoffs, and do_not_enact_if concise.
+- reasoning_matches_action is a required self-check: set it true only if your
+  headline, reasoning, and why_this_issue_first text agree with your own
+  action/option_id. If action is "dismiss", reasoning_matches_action must be
+  false whenever your own text praises, recommends, or singles out a specific
+  option as the best choice. If action is "enact", reasoning_matches_action
+  must be false whenever your own text argues for dismissing the issue.
 - Put the final JSON in the normal assistant content field if possible.
 """
 
@@ -858,6 +864,15 @@ Rules:
                 'audit_summary': {
                     'type': 'string',
                 },
+                'reasoning_matches_action': {
+                    'type': 'boolean',
+                    'description': (
+                        'Self-check: true only if headline/reasoning/'
+                        'why_this_issue_first agree with action and option_id. '
+                        'Must be false if the reasoning text argues for a '
+                        'different action than the one chosen.'
+                    ),
+                },
             },
             'required': [
                 'issue_id',
@@ -877,6 +892,7 @@ Rules:
                 'expected_tradeoffs',
                 'do_not_enact_if',
                 'audit_summary',
+                'reasoning_matches_action',
             ],
             'additionalProperties': False,
         }

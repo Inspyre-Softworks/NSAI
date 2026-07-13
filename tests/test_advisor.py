@@ -208,6 +208,7 @@ def test_fallback_recommendation_is_review_only() -> None:
     assert recommendation['factbook_draft']['requested'] is True
     assert recommendation['factbook_draft']['pertinent'] is False
     assert recommendation['factbook_draft']['reason']
+    assert recommendation['reasoning_matches_action'] is True
 
     allowed, reasons = should_manual_enact(
         recommendation=recommendation,
@@ -748,6 +749,53 @@ def test_auto_validation_blocks_zero_alignment_enact() -> None:
 
     assert result.passed is False
     assert any('positive alignment score' in reason for reason in result.reasons)
+
+
+def test_auto_validation_blocks_self_reported_reasoning_mismatch() -> None:
+    result = validate_auto_action(
+        live_issues=sample_issues(),
+        selected_issue=sample_issues()[0],
+        recommendation={
+            **sample_recommendation(),
+            'confidence': 0.92,
+            'charter_alignment_score': 92,
+            'red_line_triggered': False,
+            'reasoning_matches_action': False,
+        },
+        ai_step_statuses=[
+            {'step': 'issue_selection', 'status': 'ok'},
+            {'step': 'recommendation_generation', 'status': 'ok'},
+        ],
+        draft_dispatch=False,
+        draft_factbook=False,
+        minimum_confidence=0.8,
+    )
+
+    assert result.passed is False
+    assert any('reasoning_matches_action=false' in reason for reason in result.reasons)
+
+
+def test_auto_validation_ignores_missing_reasoning_matches_action() -> None:
+    """Cached/older recommendations predate this field; absence is not a block."""
+    result = validate_auto_action(
+        live_issues=sample_issues(),
+        selected_issue=sample_issues()[0],
+        recommendation={
+            **sample_recommendation(),
+            'confidence': 0.92,
+            'charter_alignment_score': 92,
+            'red_line_triggered': False,
+        },
+        ai_step_statuses=[
+            {'step': 'issue_selection', 'status': 'ok'},
+            {'step': 'recommendation_generation', 'status': 'ok'},
+        ],
+        draft_dispatch=False,
+        draft_factbook=False,
+        minimum_confidence=0.8,
+    )
+
+    assert result.passed is True
 
 
 def test_valid_auto_enact_calls_action_endpoint(

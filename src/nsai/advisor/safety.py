@@ -349,6 +349,12 @@ def validate_auto_action(
     if recommendation.get('requires_review'):
         reasons.append('recommendation is marked requires_review.')
 
+    if recommendation.get('reasoning_matches_action') is False:
+        reasons.append(
+            'recommendation self-reported reasoning_matches_action=false; '
+            'the model flagged its own reasoning as inconsistent with its action.'
+        )
+
     consistency = validate_recommendation_consistency(
         recommendation,
         live_issues=live_issues,

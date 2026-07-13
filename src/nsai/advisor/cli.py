@@ -27,6 +27,7 @@ from rich.progress import (
 from nsai.advisor.audit import (
     append_publication_backfill_log,
     load_audit_log_records,
+    migrate_jsonl_audit_log,
     pending_publication_entries,
     write_audit_log,
 )
@@ -101,7 +102,7 @@ DEFAULT_STRATEGY = (
     'Keep the nation prosperous, socially stable, technologically advanced, '
     'not authoritarian, and avoid absurdly destructive policies.'
 )
-DEFAULT_AUDIT_LOG = 'ns_governor_audit.jsonl'
+DEFAULT_AUDIT_LOG = 'ns_governor_audit.sqlite3'
 DEFAULT_PUBLICATION_COOLDOWN_SECONDS = 300.0
 FLAG_DISPLAY_MODES = {'ascii', 'banner', 'none'}
 FLAG_ASCII_WIDTH = 42
@@ -526,6 +527,16 @@ def print_pending_publication_entries(entries: list[dict[str, Any]]) -> None:
             print(f'Factbook: {(recommendation.get("factbook_draft") or {}).get("title", "")}')
 
 
+def run_migrate_audit_log(args: argparse.Namespace) -> None:
+    jsonl_path = Path(args.jsonl_path).expanduser().resolve()
+    db_path = Path(args.db_path).expanduser().resolve()
+
+    count = migrate_jsonl_audit_log(jsonl_path, db_path)
+
+    print(f'Imported {count} record(s) from {jsonl_path} into {db_path}.')
+    print(f'{jsonl_path} was left untouched; keep it as a backup or remove it manually.')
+
+
 def run_publication_backfill(args: argparse.Namespace) -> None:
     audit_path = Path(args.audit_log).expanduser().resolve()
     records = load_audit_log_records(audit_path)
@@ -888,7 +899,7 @@ def add_publications_arguments(subparsers: argparse._SubParsersAction) -> None:
     backfill_parser.add_argument(
         '--audit-log',
         default=DEFAULT_AUDIT_LOG,
-        help='Audit JSONL file to scan. Defaults to ns_governor_audit.jsonl.',
+        help=f'Audit SQLite database to scan. Defaults to {DEFAULT_AUDIT_LOG}.',
     )
     backfill_parser.add_argument(
         '--nation',
@@ -922,6 +933,24 @@ def add_publications_arguments(subparsers: argparse._SubParsersAction) -> None:
         help='Actually create the missing pages. Without this, only preview.',
     )
     backfill_parser.set_defaults(func=run_publication_backfill)
+
+    migrate_parser = publication_subparsers.add_parser(
+        'migrate-audit-log',
+        help='One-time import of a legacy JSONL audit log into the SQLite audit store.',
+    )
+    migrate_parser.add_argument(
+        '--from',
+        dest='jsonl_path',
+        required=True,
+        help='Path to the legacy JSONL audit log (e.g. ns_governor_audit.jsonl) to import.',
+    )
+    migrate_parser.add_argument(
+        '--to',
+        dest='db_path',
+        default=DEFAULT_AUDIT_LOG,
+        help=f'SQLite audit log to import into. Defaults to {DEFAULT_AUDIT_LOG}.',
+    )
+    migrate_parser.set_defaults(func=run_migrate_audit_log)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -1688,6 +1717,7 @@ __all__ = [
     'resolve_nation_name',
     'run_advise',
     'run_publication_backfill',
+    'run_migrate_audit_log',
     'save_advise_options',
     'publish_publication_drafts',
     'publish_backfill_draft_with_retry',

@@ -10,7 +10,7 @@ from PIL import Image
 from rich.console import Console
 
 import nsai.advisor.live as live
-from nsai.advisor.audit import write_audit_log
+from nsai.advisor.audit import load_audit_log_records, migrate_jsonl_audit_log, write_audit_log
 from nsai.advisor.live import (
     NationStatesError,
     NationStatesClient,
@@ -131,7 +131,7 @@ def advise_args(tmp_path, *, profile_path, draft_dispatch=False, draft_factbook=
         show_issues=False,
         show_instruction=False,
         no_ai=False,
-        audit_log=str(tmp_path / 'audit.jsonl'),
+        audit_log=str(tmp_path / 'audit.sqlite3'),
         base_url='http://localhost:1234/v1',
         model='test-model',
         lm_api_key=None,
@@ -384,7 +384,7 @@ def test_advise_skips_ai_issue_selection_when_only_one_issue(
         show_issues=False,
         show_instruction=False,
         no_ai=False,
-        audit_log=str(tmp_path / 'audit.jsonl'),
+        audit_log=str(tmp_path / 'audit.sqlite3'),
         base_url='http://localhost:1234/v1',
         model='test-model',
         lm_api_key=None,
@@ -469,7 +469,7 @@ def test_advise_skips_flag_shard_when_flag_display_none(
         show_issues=False,
         show_instruction=False,
         no_ai=False,
-        audit_log=str(tmp_path / 'audit.jsonl'),
+        audit_log=str(tmp_path / 'audit.sqlite3'),
         base_url='http://localhost:1234/v1',
         model='test-model',
         lm_api_key=None,
@@ -613,7 +613,7 @@ def test_model_reload_issue_selection_retry_blocks_auto_action(
     assert fake_ns.answer_calls == []
     assert fake_ns.publish_calls == []
 
-    audit_entry = json.loads((tmp_path / 'audit.jsonl').read_text(encoding='utf-8'))
+    _, audit_entry = load_audit_log_records(tmp_path / 'audit.sqlite3')[0]
     assert audit_entry['action'] == 'requires_review'
     assert audit_entry['action_applied'] is False
     assert audit_entry['blocked'] is True
@@ -862,7 +862,7 @@ def test_valid_auto_enact_calls_action_endpoint(
     run_advise(advise_args(tmp_path, profile_path=profile_path))
 
     assert fake_ns.answer_calls == [('Oringrad', '123', '2')]
-    audit_entry = json.loads((tmp_path / 'audit.jsonl').read_text(encoding='utf-8'))
+    _, audit_entry = load_audit_log_records(tmp_path / 'audit.sqlite3')[0]
     assert audit_entry['action'] == 'auto_enact'
     assert audit_entry['action_applied'] is True
     assert audit_entry['blocked'] is False
@@ -959,7 +959,7 @@ def test_auto_refreshes_unsafe_cached_advice_before_action(
     assert FakeGovernor.advise_calls == 1
     assert fake_ns.answer_calls == [('Oringrad', '123', '2')]
 
-    audit_entry = json.loads((tmp_path / 'audit.jsonl').read_text(encoding='utf-8'))
+    _, audit_entry = load_audit_log_records(tmp_path / 'audit.sqlite3')[0]
     assert audit_entry['action'] == 'auto_enact'
     assert audit_entry['action_applied'] is True
     assert audit_entry['blocked'] is False
@@ -1502,7 +1502,7 @@ def test_dismissal_recommendation_can_be_applied_with_guardrails() -> None:
 
 
 def test_write_audit_log(tmp_path) -> None:
-    path = tmp_path / 'audit.jsonl'
+    path = tmp_path / 'audit.sqlite3'
     profile_path = tmp_path / 'profile.json'
 
     write_audit_log(
@@ -1516,15 +1516,35 @@ def test_write_audit_log(tmp_path) -> None:
         result_xml=xml_to_string(ET.Element('OK')),
     )
 
-    lines = path.read_text(encoding='utf-8').splitlines()
-    assert len(lines) == 1
+    records = load_audit_log_records(path)
+    assert len(records) == 1
 
-    entry = json.loads(lines[0])
+    _, entry = records[0]
     assert entry['nation'] == 'Oringrad'
     assert entry['profile_path'] == str(profile_path)
     assert entry['action'] == 'advisor_only'
     assert entry['recommendation']['option_id'] == '2'
     assert entry['result_xml'] == '<OK />'
+
+
+def test_migrate_jsonl_audit_log_imports_without_touching_source(tmp_path) -> None:
+    jsonl_path = tmp_path / 'legacy_audit.jsonl'
+    db_path = tmp_path / 'audit.sqlite3'
+    lines = [
+        json.dumps({'timestamp': '2026-01-01T00:00:00+00:00', 'nation': 'Oringrad', 'action': 'advisor_only'}),
+        json.dumps({'timestamp': '2026-01-02T00:00:00+00:00', 'nation': 'Oringrad', 'action': 'manual_enact'}),
+    ]
+    jsonl_path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    original_jsonl_text = jsonl_path.read_text(encoding='utf-8')
+
+    count = migrate_jsonl_audit_log(jsonl_path, db_path)
+
+    assert count == 2
+    assert jsonl_path.read_text(encoding='utf-8') == original_jsonl_text
+
+    records = load_audit_log_records(db_path)
+    assert len(records) == 2
+    assert [entry['action'] for _, entry in records] == ['advisor_only', 'manual_enact']
 
 
 def test_save_advise_options_persists_defaults_and_managed_profile(

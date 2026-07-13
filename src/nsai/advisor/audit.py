@@ -1,8 +1,17 @@
-"""Advisor audit-log helpers."""
+"""Advisor audit-log helpers.
+
+Audit records are stored in a small SQLite database (one JSON blob per row)
+rather than an append-only JSONL file, so the audit trail is queryable and
+doesn't need bespoke line-number bookkeeping. Every function that used to
+take a JSONL path now takes a path to that .sqlite3 file; the row's
+autoincrement id stands in for the old line number, so callers that already
+carry around a `list[tuple[int, dict]]` need no changes.
+"""
 
 from __future__ import annotations
 
 import json
+import sqlite3
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,6 +21,93 @@ from nsai.advisor.client import NationStatesError
 from nsai.advisor.recommendations import get_profile_mode
 from nsai.advisor.safety import publication_mismatch_reasons
 from nsai.nations import normalize_nation_key
+
+
+AUDIT_SCHEMA_VERSION = 1
+
+
+class AuditStore:
+    """SQLite-backed store for advisor audit records."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_schema()
+
+    def connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.path)
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    def _ensure_schema(self) -> None:
+        with self.connect() as connection:
+            connection.execute('PRAGMA journal_mode=WAL')
+            connection.execute(
+                '''
+                CREATE TABLE IF NOT EXISTS meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+                '''
+            )
+            connection.execute(
+                '''
+                CREATE TABLE IF NOT EXISTS audit_records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    nation TEXT,
+                    record_json TEXT NOT NULL
+                )
+                '''
+            )
+            connection.execute(
+                '''
+                CREATE INDEX IF NOT EXISTS idx_audit_records_nation
+                ON audit_records (nation)
+                '''
+            )
+            connection.execute(
+                '''
+                INSERT OR REPLACE INTO meta (key, value)
+                VALUES ('schema_version', ?)
+                ''',
+                (str(AUDIT_SCHEMA_VERSION),),
+            )
+
+    def append(self, record: dict[str, Any]) -> int:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                '''
+                INSERT INTO audit_records (timestamp, nation, record_json)
+                VALUES (?, ?, ?)
+                ''',
+                (
+                    str(record.get('timestamp') or ''),
+                    record.get('nation'),
+                    json.dumps(record, ensure_ascii=False),
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def load_all(self) -> list[tuple[int, dict[str, Any]]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                'SELECT id, record_json FROM audit_records ORDER BY id'
+            ).fetchall()
+
+        records = []
+        for row in rows:
+            try:
+                record = json.loads(str(row['record_json']))
+            except json.JSONDecodeError as exc:
+                raise NationStatesError(
+                    f'Audit log {self.path} has invalid JSON in record {row["id"]}: {exc}'
+                ) from exc
+
+            if isinstance(record, dict):
+                records.append((int(row['id']), record))
+
+        return records
 
 
 def write_audit_log(
@@ -49,8 +145,7 @@ def write_audit_log(
         'fallback_issue_selection_used': fallback_issue_selection_used,
     }
 
-    with path.open('a', encoding='utf-8') as handle:
-        handle.write(json.dumps(record, ensure_ascii=False) + '\n')
+    AuditStore(path).append(record)
 
 
 def append_publication_backfill_log(
@@ -73,16 +168,27 @@ def append_publication_backfill_log(
         'publication_results': publication_results,
     }
 
-    with path.open('a', encoding='utf-8') as handle:
-        handle.write(json.dumps(record, ensure_ascii=False) + '\n')
+    AuditStore(path).append(record)
 
 
 def load_audit_log_records(path: Path) -> list[tuple[int, dict[str, Any]]]:
-    records = []
     if not path.exists():
-        return records
+        return []
 
-    for line_number, line in enumerate(path.read_text(encoding='utf-8').splitlines(), 1):
+    return AuditStore(path).load_all()
+
+
+def migrate_jsonl_audit_log(jsonl_path: Path, db_path: Path) -> int:
+    """One-time import of a legacy JSONL audit log into the SQLite store.
+
+    Never modifies or deletes jsonl_path. Returns the number of records
+    imported.
+    """
+    if not jsonl_path.exists():
+        raise NationStatesError(f'Audit log {jsonl_path} does not exist.')
+
+    records: list[dict[str, Any]] = []
+    for line_number, line in enumerate(jsonl_path.read_text(encoding='utf-8').splitlines(), 1):
         if not line.strip():
             continue
 
@@ -90,13 +196,17 @@ def load_audit_log_records(path: Path) -> list[tuple[int, dict[str, Any]]]:
             record = json.loads(line)
         except json.JSONDecodeError as exc:
             raise NationStatesError(
-                f'Audit log {path} has invalid JSON on line {line_number}: {exc}'
+                f'Audit log {jsonl_path} has invalid JSON on line {line_number}: {exc}'
             ) from exc
 
         if isinstance(record, dict):
-            records.append((line_number, record))
+            records.append(record)
 
-    return records
+    store = AuditStore(db_path)
+    for record in records:
+        store.append(record)
+
+    return len(records)
 
 
 def audit_issue_action_succeeded(record: dict[str, Any]) -> bool:
@@ -207,4 +317,4 @@ def pending_publication_entries(
     return pending
 
 
-__all__ = ['write_audit_log', 'append_publication_backfill_log', 'load_audit_log_records', 'audit_issue_action_succeeded', 'publication_source_key', 'posted_publication_keys', 'pending_publication_entries']
+__all__ = ['AuditStore', 'write_audit_log', 'append_publication_backfill_log', 'load_audit_log_records', 'migrate_jsonl_audit_log', 'audit_issue_action_succeeded', 'publication_source_key', 'posted_publication_keys', 'pending_publication_entries']

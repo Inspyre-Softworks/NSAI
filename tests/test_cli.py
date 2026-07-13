@@ -63,6 +63,7 @@ def test_cli_subcommand_help_surfaces_shapes(capsys) -> None:
     assert exc.value.code == 0
     publications_output = capsys.readouterr().out
     assert 'backfill' in publications_output
+    assert 'migrate-audit-log' in publications_output
 
     with pytest.raises(SystemExit) as exc:
         build_parser().parse_args(['publications', 'backfill', '--help'])
@@ -73,6 +74,14 @@ def test_cli_subcommand_help_surfaces_shapes(capsys) -> None:
     assert '--audit-log' in backfill_output
     assert '--cooldown-seconds' in backfill_output
     assert '--cooldown-retries' in backfill_output
+
+    with pytest.raises(SystemExit) as exc:
+        build_parser().parse_args(['publications', 'migrate-audit-log', '--help'])
+
+    assert exc.value.code == 0
+    migrate_output = capsys.readouterr().out
+    assert '--from' in migrate_output
+    assert '--to' in migrate_output
 
     with pytest.raises(SystemExit) as exc:
         build_parser().parse_args(['world', '--help'])

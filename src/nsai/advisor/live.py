@@ -753,11 +753,19 @@ def prefetch_issue_advice(
     ):
         return
 
-    cached_issue_ids = {
-        str(issue_id)
-        for issue_id in ordered_issue_ids
-        if cache.get_advice(nation, issue_id) is not None
-    }
+    cached_issue_ids: set[str] = set()
+    with cache.connect() as connection:
+        for issue_id in ordered_issue_ids:
+            row = connection.execute(
+                '''
+                SELECT 1
+                FROM issue_advice
+                WHERE nation = ? AND issue_id = ?
+                ''',
+                (nation, str(issue_id)),
+            ).fetchone()
+            if row is not None:
+                cached_issue_ids.add(str(issue_id))
     issues_to_prefetch = [
         live_issue_by_id(live_issues, issue_id)
         for issue_id in ordered_issue_ids

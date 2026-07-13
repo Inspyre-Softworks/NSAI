@@ -41,6 +41,7 @@ def test_cli_help_surfaces_commands(capsys) -> None:
     output = capsys.readouterr().out
     assert '--save-opts' in output
     assert 'profile' in output
+    assert 'check' in output
     assert 'advise' in output
     assert 'publications' in output
     assert 'nation' in output
@@ -83,8 +84,31 @@ def test_cli_subcommand_help_surfaces_shapes(capsys) -> None:
     assert '--no-nation-config' in advise_output
     assert '--refresh-advice' in advise_output
     assert '--all-issues' in advise_output
+    assert '--issue-order' in advise_output
+    assert '--no-issue-ordering' in advise_output
+    assert '--issue-id-order' in advise_output
     assert '--parallel-requests' in advise_output
+    assert '--trace-api' in advise_output
+    assert '--publication-cooldown-seconds' in advise_output
+    assert '--issue-cooldown-seconds' in advise_output
     assert '--decision-summary' in advise_output
+
+    with pytest.raises(SystemExit) as exc:
+        build_parser().parse_args(['check', '--help'])
+
+    assert exc.value.code == 0
+    check_output = capsys.readouterr().out
+    assert 'issues' in check_output
+
+    with pytest.raises(SystemExit) as exc:
+        build_parser().parse_args(['check', 'issues', '--help'])
+
+    assert exc.value.code == 0
+    check_issues_output = capsys.readouterr().out
+    assert '--nation' in check_issues_output
+    assert '--profile' in check_issues_output
+    assert '--no-nation-config' in check_issues_output
+    assert '--trace-api' in check_issues_output
 
     with pytest.raises(SystemExit) as exc:
         build_parser().parse_args(['publications', '--help'])
@@ -154,6 +178,14 @@ def test_global_save_opts_can_be_placed_before_or_after_advise() -> None:
 
     assert before.save_opts is True
     assert after.save_opts is True
+
+
+def test_check_issues_command_parses() -> None:
+    args = build_parser().parse_args(['check', 'issues', '--nation', 'Oringrad'])
+
+    assert args.command == 'check'
+    assert args.check_command == 'issues'
+    assert args.nation == 'Oringrad'
 
 
 def test_profile_interview_accepts_textual_dev_flag() -> None:

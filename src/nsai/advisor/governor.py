@@ -18,10 +18,12 @@ from nsai.advisor.client import (
     NationStatesError,
     xml_to_string,
 )
+from nsai.advisor.trace import print_api_trace
 
 
 DEFAULT_LM_BASE_URL = 'http://localhost:1234/v1'
 DEFAULT_LM_API_KEY = 'lm-studio'
+DEFAULT_LM_REQUEST_TIMEOUT_SECONDS = 1800.0
 LOCAL_MODEL_RELOAD_MAX_ATTEMPTS = 2
 PROMPT_TEXT_LIMIT = 900
 PROMPT_LONG_TEXT_LIMIT = 1800
@@ -66,6 +68,16 @@ def maybe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def local_model_request_timeout() -> float:
+    return max(
+        1.0,
+        maybe_float(
+            os.environ.get('LM_STUDIO_TIMEOUT_SECONDS'),
+            DEFAULT_LM_REQUEST_TIMEOUT_SECONDS,
+        ),
+    )
 
 
 def get_completion_text(response: Any) -> str:
@@ -442,6 +454,15 @@ def is_model_reload_error(exc: BaseException) -> bool:
     return 'model reloaded.' in str(exc).lower()
 
 
+def is_unsupported_temperature_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return (
+        'temperature' in message
+        and 'unsupported value' in message
+        and 'only the default (1)' in message
+    )
+
+
 class LocalGovernor:
     """Uses LM Studio/OpenAI-compatible local server to recommend issue choices."""
 
@@ -451,12 +472,14 @@ class LocalGovernor:
         base_url: str | None = None,
         model: str | None = None,
         api_key: str | None = None,
+        api_trace: bool = False,
     ) -> None:
         self.base_url = (
             base_url
             or os.environ.get('LM_STUDIO_BASE_URL')
             or DEFAULT_LM_BASE_URL
         )
+        self.api_trace = api_trace
         self.client = OpenAI(
             base_url=self.base_url,
             api_key=(
@@ -464,8 +487,15 @@ class LocalGovernor:
                 or os.environ.get('LM_STUDIO_API_KEY')
                 or DEFAULT_LM_API_KEY
             ),
+            max_retries=0,
+            timeout=local_model_request_timeout(),
         )
         self.model = model or os.environ.get('LM_STUDIO_MODEL') or self._detect_model()
+
+    def close(self) -> None:
+        close = getattr(self.client, 'close', None)
+        if callable(close):
+            close()
 
     def _chat_completion_with_reload_retry(
         self,
@@ -474,19 +504,64 @@ class LocalGovernor:
         pulse_label: str | None,
         **kwargs: Any,
     ) -> Any:
-        for attempt in range(1, LOCAL_MODEL_RELOAD_MAX_ATTEMPTS + 1):
+        request_kwargs = dict(kwargs)
+        attempt = 1
+        temperature_retry_used = False
+        while attempt <= LOCAL_MODEL_RELOAD_MAX_ATTEMPTS:
             try:
                 if pulse_label:
                     with StatusPulse(pulse_label):
-                        return self.client.chat.completions.create(**kwargs)
+                        response = self.client.chat.completions.create(
+                            **request_kwargs
+                        )
+                else:
+                    response = self.client.chat.completions.create(**request_kwargs)
 
-                return self.client.chat.completions.create(**kwargs)
+                if self.api_trace:
+                    print_api_trace(
+                        api='local model',
+                        operation=f'chat.completions.create ({step_name})',
+                        request={
+                            'base_url': self.base_url,
+                            'attempt': attempt,
+                            'step_name': step_name,
+                            **request_kwargs,
+                        },
+                        response=jsonable(response),
+                    )
+                return response
             except Exception as exc:
+                if self.api_trace:
+                    print_api_trace(
+                        api='local model',
+                        operation=f'chat.completions.create ({step_name})',
+                        request={
+                            'base_url': self.base_url,
+                            'attempt': attempt,
+                            'step_name': step_name,
+                            **request_kwargs,
+                        },
+                        error=exc,
+                    )
+                if (
+                    is_unsupported_temperature_error(exc)
+                    and 'temperature' in request_kwargs
+                    and not temperature_retry_used
+                ):
+                    temperature_retry_used = True
+                    temperature = request_kwargs.pop('temperature')
+                    print(
+                        f'[Model does not support custom temperature {temperature}; '
+                        'retrying with the provider default.]'
+                    )
+                    continue
+
                 if is_model_reload_error(exc) and attempt < LOCAL_MODEL_RELOAD_MAX_ATTEMPTS:
                     print(
                         f'[Local model reloaded during {step_name}; retrying '
                         f'AI step ({attempt + 1}/{LOCAL_MODEL_RELOAD_MAX_ATTEMPTS}): {exc}]'
                     )
+                    attempt += 1
                     continue
 
                 raise
@@ -494,8 +569,26 @@ class LocalGovernor:
         raise RuntimeError(f'{step_name} failed after model reload retries.')
 
     def _detect_model(self) -> str:
-        with StatusPulse('AI setup: detecting loaded local model'):
-            models = self.client.models.list()
+        try:
+            with StatusPulse('AI setup: detecting loaded local model'):
+                models = self.client.models.list()
+        except Exception as exc:
+            if self.api_trace:
+                print_api_trace(
+                    api='local model',
+                    operation='models.list',
+                    request={'base_url': self.base_url},
+                    error=exc,
+                )
+            raise
+
+        if self.api_trace:
+            print_api_trace(
+                api='local model',
+                operation='models.list',
+                request={'base_url': self.base_url},
+                response=jsonable(models),
+            )
         if not models.data:
             raise RuntimeError('No local Studio model is loaded.')
         return models.data[0].id
@@ -803,6 +896,8 @@ Rules:
         draft_dispatch: bool = False,
         draft_factbook: bool = False,
         pulse_label: str | None = 'AI step: generating recommendation for selected issue',
+        retry_text_mode: bool = True,
+        fallback_on_failure: bool = True,
     ) -> dict[str, Any]:
         # Late import to avoid circular dependency (recommendations imports from governor)
         from nsai.advisor.recommendations import (
@@ -1062,6 +1157,8 @@ Rules:
             )
         except Exception as exc:
             if is_model_reload_error(exc):
+                if not fallback_on_failure:
+                    raise
                 print(
                     '[Local AI recommendation failed after model reload retries. '
                     f'Using deterministic fallback: {exc}]'
@@ -1078,6 +1175,9 @@ Rules:
                     'requires_review': True,
                 })
                 return recommendation
+
+            if not retry_text_mode:
+                raise
 
             print(f'[json_schema failed, falling back to text mode: {exc}]')
             structured_output_repaired = True
@@ -1096,6 +1196,8 @@ Rules:
                     response_format={'type': 'text'},
                 )
             except Exception as retry_exc:
+                if not fallback_on_failure:
+                    raise
                 print(
                     '[Local AI text-mode recommendation failed. '
                     f'Using deterministic fallback: {retry_exc}]'
@@ -1116,6 +1218,8 @@ Rules:
         text = get_completion_text(response)
 
         if not text:
+            if not fallback_on_failure:
+                raise ValueError('AI returned no visible content.')
             print('[AI returned no visible content. Using deterministic fallback.]')
             recommendation = fallback_recommendation(
                 live_issues,
@@ -1134,6 +1238,8 @@ Rules:
             recommendation, repaired = parse_json_object_with_repair(text)
             structured_output_repaired = structured_output_repaired or repaired
         except Exception as exc:
+            if not fallback_on_failure:
+                raise
             print('[AI returned unparsable output. Using deterministic fallback.]')
             print('[Raw AI text follows]')
             print(text)
@@ -1158,6 +1264,8 @@ Rules:
                 draft_factbook=draft_factbook,
             )
         except NationStatesError as exc:
+            if not fallback_on_failure:
+                raise
             print(f'[AI returned invalid recommendation. Using deterministic fallback: {exc}]')
             print('[Raw AI text follows]')
             print(text)

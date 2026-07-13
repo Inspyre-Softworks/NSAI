@@ -397,9 +397,6 @@ def is_cached_advice_usable(
 ) -> tuple[bool, str]:
     recommendation = dict(cached_advice.recommendation)
 
-    if is_fallback_recommendation(recommendation) and not no_ai:
-        return False, 'cached fallback advice is not reused when AI is enabled'
-
     try:
         validate_recommendation(recommendation, valid_options)
         validate_publication_drafts(
@@ -409,24 +406,6 @@ def is_cached_advice_usable(
         )
     except NationStatesError as exc:
         return False, str(exc)
-
-    if auto_requested:
-        validation = validate_auto_action(
-            live_issues=live_issues or [],
-            selected_issue=selected_issue,
-            recommendation=recommendation,
-            ai_step_statuses=ai_step_statuses or [],
-            draft_dispatch=draft_dispatch,
-            draft_factbook=draft_factbook,
-            minimum_confidence=minimum_confidence,
-            allow_fallback_auto=allow_fallback_auto,
-        )
-        if not validation.passed:
-            return (
-                False,
-                'cached advice is not safe for auto mode: '
-                + '; '.join(validation.reasons),
-            )
 
     return True, ''
 
@@ -654,4 +633,4 @@ def should_manual_enact(
     return True, ['Manual --enact requested and guardrails passed.']
 
 
-__all__ = ['extract_live_issues', 'collect_issue_option_ids', 'validate_recommendation', 'empty_dispatch_draft', 'empty_factbook_draft', 'validate_publication_drafts', 'fallback_issue_choice', 'fallback_issue_order', 'fallback_recommendation', 'is_cached_advice_usable', 'print_live_issues', 'print_recommendation', 'print_publication_drafts', 'get_profile_min_confidence', 'get_profile_mode', 'is_fallback_recommendation', 'recommendation_action', 'is_dismiss_recommendation', 'should_auto_enact', 'should_manual_enact']
+__all__ = ['extract_live_issues', 'collect_issue_option_ids', 'validate_recommendation', 'empty_dispatch_draft', 'empty_factbook_draft', 'validate_publication_drafts', 'fallback_issue_choice', 'fallback_issue_order', 'fallback_recommendation', 'is_cached_advice_usable', 'print_live_issues', 'print_recommendation', 'print_publication_drafts', 'get_profile_min_confidence', 'get_profile_mode', 'is_fallback_recommendation', 'recommendation_action', 'is_dismiss_recommendation', 'should_auto_enact', 'should_manual_enact', 'validate_auto_action']

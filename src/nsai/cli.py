@@ -9,8 +9,10 @@ from nsai import __version__
 from nsai.help import NSAIArgumentParser
 from nsai.advisor.live import (
     add_advise_arguments,
+    add_check_issues_arguments,
     add_publications_arguments,
     run_advise,
+    run_check_issues,
 )
 from nsai.nations import add_nation_arguments
 from nsai.world_dataset import add_world_arguments
@@ -111,6 +113,19 @@ def build_parser() -> argparse.ArgumentParser:
     add_advise_arguments(advise_parser)
     advise_parser.set_defaults(func=run_advise)
 
+    check_parser = subparsers.add_parser(
+        'check',
+        help='Run read-only NationStates checks.',
+    )
+    check_subparsers = check_parser.add_subparsers(dest='check_command')
+
+    check_issues_parser = check_subparsers.add_parser(
+        'issues',
+        help='List current live NationStates issues without AI or actions.',
+    )
+    add_check_issues_arguments(check_issues_parser)
+    check_issues_parser.set_defaults(func=run_check_issues)
+
     add_publications_arguments(subparsers)
 
     add_nation_arguments(subparsers)
@@ -163,6 +178,15 @@ def _run(argv: list[str] | None = None) -> None:
             if isinstance(action, argparse._SubParsersAction)
         ).choices['publications']
         publications_parser.print_help()
+        return
+
+    if args.command == 'check' and args.check_command is None:
+        check_parser = next(
+            action
+            for action in parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        ).choices['check']
+        check_parser.print_help()
         return
 
     args.func(args)

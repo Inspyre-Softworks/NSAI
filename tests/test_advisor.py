@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import time
+from datetime import datetime, timezone
 from io import BytesIO
 from types import SimpleNamespace
 import xml.etree.ElementTree as ET
@@ -23,7 +25,7 @@ from nsai.advisor.live import (
     save_advise_options,
     xml_to_string,
 )
-from nsai.advisor.governor import build_governor_instruction
+from nsai.advisor.governor import LocalGovernor, build_governor_instruction
 from nsai.advisor.recommendations import (
     collect_issue_option_ids,
     extract_live_issues,
@@ -168,6 +170,9 @@ def advise_args(tmp_path, *, profile_path, draft_dispatch=False, draft_factbook=
         auto=True,
         allow_fallback_auto=False,
         override_red_line=False,
+        trace_api=False,
+        issue_cooldown_seconds=0.0,
+        publication_cooldown_seconds=0.0,
     )
 
 
@@ -338,6 +343,58 @@ def test_render_banner_includes_nation_name() -> None:
 
     assert 'Oringrad' in banner
     assert banner.count('=') >= 40
+
+
+def test_check_issues_lists_live_issues_without_advisor_side_effects(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.setenv('NSAI_CONFIG_HOME', str(tmp_path / 'config-home'))
+
+    class FakeNationStatesClient:
+        def __init__(self) -> None:
+            self.issue_calls = []
+
+        def issues(self, nation):
+            self.issue_calls.append(nation)
+            return ET.fromstring(
+                '''
+                <NATION>
+                  <ISSUES>
+                    <ISSUE id="123">
+                      <TITLE>Robot Teachers</TITLE>
+                      <TEXT>Schools want robot teachers.</TEXT>
+                      <OPTION id="1">Ban them.</OPTION>
+                      <OPTION id="2">Regulate them.</OPTION>
+                    </ISSUE>
+                  </ISSUES>
+                </NATION>
+                '''
+            )
+
+    fake_ns = FakeNationStatesClient()
+    monkeypatch.setattr(
+        live.NationStatesClient,
+        'from_env',
+        classmethod(lambda cls, nation_config=None: fake_ns),
+    )
+
+    args = SimpleNamespace(
+        profile=None,
+        nation='Oringrad',
+        no_nation_config=True,
+        trace_api=False,
+    )
+
+    live.run_check_issues(args)
+
+    output = capsys.readouterr().out
+    assert fake_ns.issue_calls == ['Oringrad']
+    assert 'Live NationStates Issues' in output
+    assert 'Issue 123: Robot Teachers' in output
+    assert 'Found 1 live issue(s) for Oringrad.' in output
+    assert not (tmp_path / 'audit.jsonl').exists()
 
 
 def test_advise_skips_ai_issue_selection_when_only_one_issue(
@@ -643,6 +700,42 @@ def test_model_reload_issue_selection_retry_blocks_auto_action(
     assert audit_entry['blocked'] is True
     assert audit_entry['fallback_issue_selection_used'] is True
     assert any('AI step failed during issue_selection' in reason for reason in audit_entry['block_reasons'])
+
+
+def test_recommendation_can_disable_text_retry_for_prefetch() -> None:
+    class FakeCompletions:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def create(self, **kwargs):
+            self.calls += 1
+            raise RuntimeError('local model request failed')
+
+    class FakeOpenAIClient:
+        def __init__(self) -> None:
+            self.completions = FakeCompletions()
+            self.chat = SimpleNamespace(completions=self.completions)
+
+    governor = LocalGovernor.__new__(LocalGovernor)
+    governor.base_url = 'http://localhost:1234/v1'
+    governor.model = 'test-model'
+    governor.api_trace = False
+    governor.client = FakeOpenAIClient()
+
+    with pytest.raises(RuntimeError, match='local model request failed'):
+        governor.advise(
+            nation_snapshot_xml='<NATION />',
+            live_issues=sample_issues(),
+            strategy='keep things stable',
+            profile=None,
+            draft_dispatch=False,
+            draft_factbook=False,
+            pulse_label=None,
+            retry_text_mode=False,
+            fallback_on_failure=False,
+        )
+
+    assert governor.client.completions.calls == 1
 
 
 def test_contradictory_dismiss_recommendation_fails_validation() -> None:
@@ -1119,6 +1212,266 @@ def test_all_issues_reuses_cached_covering_order_plan(
     assert '1. Orbital Farms (456)' in output
 
 
+def test_all_issues_reuses_cached_fallback_order_plan_when_ai_available(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.setenv('NSAI_CONFIG_HOME', str(tmp_path / 'config-home'))
+    profile_path = write_auto_profile(tmp_path)
+    live.AdviceCache().save_issue_plan(
+        nation='Oringrad',
+        live_issues=[
+            {
+                'issue_id': '456',
+                'title': 'Orbital Farms',
+                'text': 'Farmers want orbital hydroponics grants.',
+                'options': [{'option_id': '1', 'text': 'Fund them.'}],
+            },
+            {
+                'issue_id': '123',
+                'title': 'Robot Teachers',
+                'text': 'Schools want robot teachers.',
+                'options': [{'option_id': '1', 'text': 'Regulate them.'}],
+            },
+        ],
+        ordered_issue_ids=['456', '123'],
+        reasons={
+            '456': 'Deterministic fallback kept the live issue order.',
+            '123': 'Deterministic fallback kept the live issue order.',
+        },
+        source='fallback',
+        token_usage={},
+    )
+
+    class FakeNationStatesClient:
+        user_agent = 'NSAI-Test/0.1 contact:test@example.com nation:Oringrad'
+        api_version = None
+
+        def public_nation(self, nation, shards):
+            return ET.fromstring('<NATION id="oringrad"><FULLNAME>Oringrad</FULLNAME></NATION>')
+
+        def issues(self, nation):
+            return ET.fromstring(
+                '''
+                <NATION>
+                  <ISSUES>
+                    <ISSUE id="456">
+                      <TITLE>Orbital Farms</TITLE>
+                      <TEXT>Farmers want orbital hydroponics grants.</TEXT>
+                      <OPTION id="1">Fund them.</OPTION>
+                    </ISSUE>
+                    <ISSUE id="123">
+                      <TITLE>Robot Teachers</TITLE>
+                      <TEXT>Schools want robot teachers.</TEXT>
+                      <OPTION id="1">Regulate them.</OPTION>
+                    </ISSUE>
+                  </ISSUES>
+                </NATION>
+                '''
+            )
+
+    class FakeGovernor:
+        advise_issue_ids: list[str] = []
+
+        def __init__(self, *, base_url=None, model=None, api_key=None):
+            self.base_url = base_url or 'http://localhost:1234/v1'
+            self.model = model or 'test-model'
+
+        def plan_issue_order(self, **kwargs):
+            raise AssertionError('cached fallback plan should be reused')
+
+        def advise(self, *, live_issues, **kwargs):
+            issue = live_issues[0]
+            issue_id = str(issue['issue_id'])
+            FakeGovernor.advise_issue_ids.append(issue_id)
+            return {
+                **sample_recommendation(),
+                'issue_id': issue_id,
+                'option_id': str(issue['options'][0]['option_id']),
+                'headline': f'Handle issue {issue_id}',
+                'model': self.model,
+            }
+
+    monkeypatch.setattr(
+        live.NationStatesClient,
+        'from_env',
+        classmethod(lambda cls, nation_config=None: FakeNationStatesClient()),
+    )
+    monkeypatch.setattr(live, 'LocalGovernor', FakeGovernor)
+
+    args = advise_args(tmp_path, profile_path=profile_path)
+    args.all_issues = True
+    args.auto = False
+    args.refresh_advice = False
+    args.flag_display = 'none'
+
+    run_advise(args)
+    output = capsys.readouterr().out
+
+    assert FakeGovernor.advise_issue_ids == ['456', '123']
+    assert 'AI step skipped: reused cached all-issues order plan.' in output
+    assert 'Cached deterministic fallback all-issues order plan ignored' not in output
+
+
+def test_all_issues_can_skip_ai_ordering_with_arrival_order(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.setenv('NSAI_CONFIG_HOME', str(tmp_path / 'config-home'))
+    profile_path = write_auto_profile(tmp_path)
+
+    class FakeNationStatesClient:
+        user_agent = 'NSAI-Test/0.1 contact:test@example.com nation:Oringrad'
+        api_version = None
+
+        def public_nation(self, nation, shards):
+            return ET.fromstring('<NATION id="oringrad"><FULLNAME>Oringrad</FULLNAME></NATION>')
+
+        def issues(self, nation):
+            return ET.fromstring(
+                '''
+                <NATION>
+                  <ISSUES>
+                    <ISSUE id="456">
+                      <TITLE>Orbital Farms</TITLE>
+                      <TEXT>Farmers want orbital hydroponics grants.</TEXT>
+                      <OPTION id="1">Fund them.</OPTION>
+                    </ISSUE>
+                    <ISSUE id="123">
+                      <TITLE>Robot Teachers</TITLE>
+                      <TEXT>Schools want robot teachers.</TEXT>
+                      <OPTION id="1">Regulate them.</OPTION>
+                    </ISSUE>
+                  </ISSUES>
+                </NATION>
+                '''
+            )
+
+    class FakeGovernor:
+        advise_issue_ids: list[str] = []
+
+        def __init__(self, *, base_url=None, model=None, api_key=None):
+            self.base_url = base_url or 'http://localhost:1234/v1'
+            self.model = model or 'test-model'
+
+        def plan_issue_order(self, **kwargs):
+            raise AssertionError('arrival ordering should not ask AI to order')
+
+        def advise(self, *, live_issues, **kwargs):
+            issue = live_issues[0]
+            issue_id = str(issue['issue_id'])
+            FakeGovernor.advise_issue_ids.append(issue_id)
+            return {
+                **sample_recommendation(),
+                'issue_id': issue_id,
+                'option_id': str(issue['options'][0]['option_id']),
+                'headline': f'Handle issue {issue_id}',
+                'model': self.model,
+            }
+
+    monkeypatch.setattr(
+        live.NationStatesClient,
+        'from_env',
+        classmethod(lambda cls, nation_config=None: FakeNationStatesClient()),
+    )
+    monkeypatch.setattr(live, 'LocalGovernor', FakeGovernor)
+
+    args = advise_args(tmp_path, profile_path=profile_path)
+    args.all_issues = True
+    args.auto = False
+    args.refresh_advice = False
+    args.flag_display = 'none'
+    args.issue_order = 'arrival'
+
+    run_advise(args)
+    output = capsys.readouterr().out
+
+    assert FakeGovernor.advise_issue_ids == ['456', '123']
+    assert 'AI step skipped: issue ordering is disabled' in output
+    assert '1. Orbital Farms (456)' in output
+
+
+def test_all_issues_can_sort_by_issue_id_without_ai_ordering(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.setenv('NSAI_CONFIG_HOME', str(tmp_path / 'config-home'))
+    profile_path = write_auto_profile(tmp_path)
+
+    class FakeNationStatesClient:
+        user_agent = 'NSAI-Test/0.1 contact:test@example.com nation:Oringrad'
+        api_version = None
+
+        def public_nation(self, nation, shards):
+            return ET.fromstring('<NATION id="oringrad"><FULLNAME>Oringrad</FULLNAME></NATION>')
+
+        def issues(self, nation):
+            return ET.fromstring(
+                '''
+                <NATION>
+                  <ISSUES>
+                    <ISSUE id="456">
+                      <TITLE>Orbital Farms</TITLE>
+                      <TEXT>Farmers want orbital hydroponics grants.</TEXT>
+                      <OPTION id="1">Fund them.</OPTION>
+                    </ISSUE>
+                    <ISSUE id="123">
+                      <TITLE>Robot Teachers</TITLE>
+                      <TEXT>Schools want robot teachers.</TEXT>
+                      <OPTION id="1">Regulate them.</OPTION>
+                    </ISSUE>
+                  </ISSUES>
+                </NATION>
+                '''
+            )
+
+    class FakeGovernor:
+        advise_issue_ids: list[str] = []
+
+        def __init__(self, *, base_url=None, model=None, api_key=None):
+            self.base_url = base_url or 'http://localhost:1234/v1'
+            self.model = model or 'test-model'
+
+        def plan_issue_order(self, **kwargs):
+            raise AssertionError('ID ordering should not ask AI to order')
+
+        def advise(self, *, live_issues, **kwargs):
+            issue = live_issues[0]
+            issue_id = str(issue['issue_id'])
+            FakeGovernor.advise_issue_ids.append(issue_id)
+            return {
+                **sample_recommendation(),
+                'issue_id': issue_id,
+                'option_id': str(issue['options'][0]['option_id']),
+                'headline': f'Handle issue {issue_id}',
+                'model': self.model,
+            }
+
+    monkeypatch.setattr(
+        live.NationStatesClient,
+        'from_env',
+        classmethod(lambda cls, nation_config=None: FakeNationStatesClient()),
+    )
+    monkeypatch.setattr(live, 'LocalGovernor', FakeGovernor)
+
+    args = advise_args(tmp_path, profile_path=profile_path)
+    args.all_issues = True
+    args.auto = False
+    args.refresh_advice = False
+    args.flag_display = 'none'
+    args.issue_order = 'id'
+
+    run_advise(args)
+    output = capsys.readouterr().out
+
+    assert FakeGovernor.advise_issue_ids == ['123', '456']
+    assert 'AI step skipped: --issue-order id is set; sorting issues by ID.' in output
+    assert '1. Robot Teachers (123)' in output
+
+
 def test_all_issues_child_runs_reuse_loaded_nationstates_data(
     tmp_path,
     monkeypatch,
@@ -1320,8 +1673,8 @@ def test_all_issues_single_issue_order_is_not_auto_blocking_fallback(
 
     assert FakeGovernor.advise_issue_ids == ['123']
     assert fake_ns.answer_calls == [('Oringrad', '123', '2')]
-    assert output.count('Cached deterministic fallback all-issues order plan ignored') == 1
-    assert 'AI step skipped: only one live issue is present for all-issues order.' in output
+    assert 'Cached deterministic fallback all-issues order plan ignored' not in output
+    assert 'AI step skipped: reused cached all-issues order plan.' in output
     assert 'AI step skipped: reused cached recommendation.' in output
     assert 'Cached advice for issue 123 cannot be reused' not in output
     assert 'deterministic fallback was used for issue_selection' not in output
@@ -1364,12 +1717,15 @@ def test_all_issues_parallel_requests_prefetch_missing_advice(
 
     class FakeGovernor:
         plan_calls = 0
+        model_detection_inits = 0
         advise_issue_ids: list[str] = []
         advise_pulse_labels: list[str | None] = []
 
         def __init__(self, *, base_url=None, model=None, api_key=None):
             self.base_url = base_url or 'http://localhost:1234/v1'
             self.model = model or 'test-model'
+            if model is None:
+                FakeGovernor.model_detection_inits += 1
 
         def plan_issue_order(self, **kwargs):
             FakeGovernor.plan_calls += 1
@@ -1408,11 +1764,13 @@ def test_all_issues_parallel_requests_prefetch_missing_advice(
     args.refresh_advice = False
     args.flag_display = 'none'
     args.parallel_requests = 2
+    args.model = None
 
     run_advise(args)
     output = capsys.readouterr().out
 
     assert FakeGovernor.plan_calls == 1
+    assert FakeGovernor.model_detection_inits == 1
     assert sorted(FakeGovernor.advise_issue_ids) == ['123', '456']
     assert FakeGovernor.advise_pulse_labels == [None, None]
     assert output.count('AI step skipped: reused cached recommendation.') == 2
@@ -1544,7 +1902,480 @@ def test_all_issues_progress_uses_stable_timer_layout() -> None:
     assert transient_progress.live.transient is True
 
 
-def test_auto_refreshes_unsafe_cached_advice_before_action(
+def test_parallel_prefetch_respects_existing_escape_cancel(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv('NSAI_CONFIG_HOME', str(tmp_path / 'config-home'))
+    profile_path = write_auto_profile(tmp_path)
+
+    class CancelMonitor:
+        def cancel_requested(self) -> bool:
+            return True
+
+    args = advise_args(tmp_path, profile_path=profile_path)
+    args.refresh_advice = False
+    args.parallel_requests = 2
+    args._cancel_monitor = CancelMonitor()
+
+    cache = live.AdviceCache()
+    issues = sample_issues()
+
+    with pytest.raises(live.AdvisorCancelled):
+        live.prefetch_issue_advice(
+            args=args,
+            nation='Oringrad',
+            ordered_issue_ids=['123'],
+            live_issues=issues,
+            cache=cache,
+            strategy='keep things stable',
+            profile=None,
+            nation_snapshot_xml='<NATION />',
+            lm_base_url='http://localhost:1234/v1',
+            lm_model='test-model',
+            lm_api_key='not-needed',
+            draft_dispatch=False,
+            draft_factbook=False,
+            valid_options=collect_issue_option_ids(issues),
+            console=Console(record=True, color_system=None),
+        )
+
+
+def test_parallel_prefetch_failure_does_not_cache_fallback_advice(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv('NSAI_CONFIG_HOME', str(tmp_path / 'config-home'))
+    profile_path = write_auto_profile(tmp_path)
+    seen_kwargs: list[dict[str, object]] = []
+
+    class FakeGovernor:
+        def __init__(self, *, base_url=None, model=None, api_key=None):
+            self.base_url = base_url or 'http://localhost:1234/v1'
+            self.model = model or 'test-model'
+
+        def advise(self, *, live_issues, **kwargs):
+            seen_kwargs.append(kwargs)
+            raise RuntimeError('prefetch model request failed')
+
+    monkeypatch.setattr(live, 'LocalGovernor', FakeGovernor)
+
+    args = advise_args(tmp_path, profile_path=profile_path)
+    args.refresh_advice = False
+    args.parallel_requests = 2
+    cache = live.AdviceCache()
+    issues = sample_issues()
+    console = Console(record=True, color_system=None)
+
+    live.prefetch_issue_advice(
+        args=args,
+        nation='Oringrad',
+        ordered_issue_ids=['123'],
+        live_issues=issues,
+        cache=cache,
+        strategy='keep things stable',
+        profile=None,
+        nation_snapshot_xml='<NATION />',
+        lm_base_url='http://localhost:1234/v1',
+        lm_model='test-model',
+        lm_api_key='not-needed',
+        draft_dispatch=False,
+        draft_factbook=False,
+        valid_options=collect_issue_option_ids(issues),
+        console=console,
+    )
+
+    assert seen_kwargs
+    assert seen_kwargs[0]['retry_text_mode'] is False
+    assert seen_kwargs[0]['fallback_on_failure'] is False
+    assert cache.get_advice('Oringrad', '123') is None
+    assert 'Sequential all-issues processing will retry that issue.' in console.export_text()
+
+
+def test_all_issues_escape_monitor_is_active_during_prefetch(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.setenv('NSAI_CONFIG_HOME', str(tmp_path / 'config-home'))
+    profile_path = write_auto_profile(tmp_path)
+    seen_monitor = {'active': False}
+
+    def fake_prefetch_issue_advice(**kwargs):
+        monitor = getattr(kwargs['args'], '_cancel_monitor', None)
+        seen_monitor['active'] = isinstance(monitor, live.EscapeCancelMonitor)
+        raise live.AdvisorCancelled('Cancelled by Escape.')
+
+    monkeypatch.setattr(live, 'prefetch_issue_advice', fake_prefetch_issue_advice)
+
+    args = advise_args(tmp_path, profile_path=profile_path)
+    args.issue_order = 'arrival'
+    args.refresh_advice = False
+    args.parallel_requests = 4
+    issues = [
+        {
+            'issue_id': '123',
+            'title': 'Robot Teachers',
+            'text': 'Schools want robot teachers.',
+            'options': [{'option_id': '1', 'text': 'Regulate them.'}],
+        },
+        {
+            'issue_id': '456',
+            'title': 'Orbital Farms',
+            'text': 'Farmers want orbital hydroponics grants.',
+            'options': [{'option_id': '1', 'text': 'Fund them.'}],
+        },
+    ]
+
+    live.run_all_issues(
+        args,
+        nation='Oringrad',
+        ns=object(),  # type: ignore[arg-type]
+        nation_root=ET.fromstring('<NATION id="oringrad" />'),
+        live_issues=issues,
+        cache=live.AdviceCache(),
+        strategy='keep things stable',
+        profile=None,
+        nation_snapshot_xml='<NATION />',
+        get_governor=lambda: pytest.fail('arrival order should not need a governor'),
+        lm_base_url='http://localhost:1234/v1',
+        lm_model='test-model',
+        lm_api_key='not-needed',
+        draft_dispatch=False,
+        draft_factbook=False,
+        valid_options=collect_issue_option_ids(issues),
+    )
+
+    output = capsys.readouterr().out
+    assert seen_monitor['active'] is True
+    assert not hasattr(args, '_cancel_monitor')
+    assert 'All-issues run cancelled by Escape.' in output
+    assert 'Processed:       0/2 issue(s)' in output
+
+
+def test_cooldown_state_can_seed_from_recent_audit_log(tmp_path) -> None:
+    audit_log = tmp_path / 'audit.jsonl'
+    audit_log.write_text(
+        json.dumps({
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'nation': 'Oringrad',
+            'action_applied': True,
+            'publication_results': [
+                {'kind': 'dispatch', 'status': 'posted'},
+            ],
+        })
+        + '\n',
+        encoding='utf-8',
+    )
+    publication_state = {'cooldown_hit': False, 'last_post_at': None}
+    issue_state = {'last_action_at': None}
+
+    live.seed_cooldown_state_from_audit(
+        publication_state=publication_state,
+        issue_state=issue_state,
+        audit_log=audit_log,
+        nation='oringrad',
+    )
+
+    now = time.monotonic()
+    assert isinstance(issue_state['last_action_at'], float)
+    assert isinstance(publication_state['last_post_at'], float)
+    assert 0 <= now - issue_state['last_action_at'] < 2
+    assert 0 <= now - publication_state['last_post_at'] < 2
+
+
+def test_publication_cooldown_seed_counts_failed_attempts(tmp_path) -> None:
+    audit_log = tmp_path / 'audit.jsonl'
+    audit_log.write_text(
+        json.dumps({
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'nation': 'Oringrad',
+            'action_applied': True,
+            'publication_results': [
+                {
+                    'kind': 'dispatch',
+                    'status': 'failed',
+                    'error': (
+                        'Your nation is attempting to issue many announcements '
+                        'in a short period of time. Please wait for the international '
+                        'press to catch their breath, then try again.'
+                    ),
+                },
+            ],
+        })
+        + '\n',
+        encoding='utf-8',
+    )
+    publication_state = {'cooldown_hit': False, 'last_post_at': None}
+    issue_state = {'last_action_at': None}
+
+    live.seed_cooldown_state_from_audit(
+        publication_state=publication_state,
+        issue_state=issue_state,
+        audit_log=audit_log,
+        nation='Oringrad',
+    )
+
+    assert isinstance(publication_state['last_post_at'], float)
+    assert time.monotonic() - publication_state['last_post_at'] < 2
+
+
+def test_all_issues_paces_issue_actions_and_publications(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.setenv('NSAI_CONFIG_HOME', str(tmp_path / 'config-home'))
+    profile_path = write_auto_profile(tmp_path)
+    sleeps: list[tuple[float, str]] = []
+
+    def fake_sleep_with_progress(seconds, *, description, console):
+        sleeps.append((seconds, description))
+
+    monkeypatch.setattr(live, 'sleep_with_progress', fake_sleep_with_progress)
+
+    class FakeNationStatesClient:
+        user_agent = 'NSAI-Test/0.1 contact:test@example.com nation:Oringrad'
+        api_version = None
+
+        def __init__(self) -> None:
+            self.answer_calls = []
+            self.publish_calls = []
+
+        def public_nation(self, nation, shards):
+            return ET.fromstring('<NATION id="oringrad"><FULLNAME>Oringrad</FULLNAME></NATION>')
+
+        def issues(self, nation):
+            return ET.fromstring(
+                '''
+                <NATION>
+                  <ISSUES>
+                    <ISSUE id="123">
+                      <TITLE>Robot Teachers</TITLE>
+                      <TEXT>Schools want robot teachers.</TEXT>
+                      <OPTION id="1">Regulate them.</OPTION>
+                    </ISSUE>
+                    <ISSUE id="456">
+                      <TITLE>Orbital Farms</TITLE>
+                      <TEXT>Farmers want orbital hydroponics grants.</TEXT>
+                      <OPTION id="1">Fund them.</OPTION>
+                    </ISSUE>
+                  </ISSUES>
+                </NATION>
+                '''
+            )
+
+        def answer_issue(self, nation, issue_id, option_id):
+            self.answer_calls.append((nation, issue_id, option_id))
+            return ET.fromstring('<NATION><ISSUE><OK>1</OK></ISSUE></NATION>')
+
+        def create_dispatch(self, nation, *, title, text, category, subcategory):
+            self.publish_calls.append((nation, title, text, category, subcategory))
+            return ET.fromstring('<NATION><SUCCESS>Created.</SUCCESS></NATION>')
+
+    class FakeGovernor:
+        advise_issue_ids: list[str] = []
+
+        def __init__(self, *, base_url=None, model=None, api_key=None):
+            self.base_url = base_url or 'http://localhost:1234/v1'
+            self.model = model or 'test-model'
+
+        def plan_issue_order(self, **kwargs):
+            raise AssertionError('arrival order should skip AI ordering')
+
+        def advise(self, *, live_issues, **kwargs):
+            issue = live_issues[0]
+            issue_id = str(issue['issue_id'])
+            FakeGovernor.advise_issue_ids.append(issue_id)
+            return {
+                **sample_recommendation(),
+                'issue_id': issue_id,
+                'option_id': '1',
+                'action': 'enact',
+                'confidence': 0.95,
+                'charter_alignment_score': 95,
+                'red_line_triggered': False,
+                'headline': f'Handle issue {issue_id}',
+                'model': self.model,
+                'dispatch_draft': {
+                    'requested': True,
+                    'title': f'Issue {issue_id} Update',
+                    'text': f'Policy update for issue {issue_id}.',
+                    'category_hint': 'Bulletin',
+                    'subcategory_hint': 'News',
+                },
+            }
+
+    fake_ns = FakeNationStatesClient()
+    monkeypatch.setattr(
+        live.NationStatesClient,
+        'from_env',
+        classmethod(lambda cls, nation_config=None: fake_ns),
+    )
+    monkeypatch.setattr(live, 'LocalGovernor', FakeGovernor)
+
+    args = advise_args(
+        tmp_path,
+        profile_path=profile_path,
+        draft_dispatch=True,
+    )
+    args.all_issues = True
+    args.auto = True
+    args.refresh_advice = True
+    args.flag_display = 'none'
+    args.issue_order = 'arrival'
+    args.issue_cooldown_seconds = 7.0
+    args.publication_cooldown_seconds = 11.0
+
+    run_advise(args)
+    capsys.readouterr()
+
+    assert FakeGovernor.advise_issue_ids == ['123', '456']
+    assert fake_ns.answer_calls == [
+        ('Oringrad', '123', '1'),
+        ('Oringrad', '456', '1'),
+    ]
+    assert [call[1] for call in fake_ns.publish_calls] == [
+        'Issue 123 Update',
+        'Issue 456 Update',
+    ]
+    assert len(sleeps) == 2
+    assert sleeps[0][0] > 0
+    assert sleeps[0][1] == 'NationStates issue cooldown for Oringrad'
+    assert sleeps[1][0] > 0
+    assert sleeps[1][1] == 'NationStates publication cooldown for Oringrad'
+
+
+def test_all_issues_skips_later_publications_after_cooldown_error(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.setenv('NSAI_CONFIG_HOME', str(tmp_path / 'config-home'))
+    profile_path = write_auto_profile(tmp_path)
+
+    class FakeNationStatesClient:
+        user_agent = 'NSAI-Test/0.1 contact:test@example.com nation:Oringrad'
+        api_version = None
+
+        def __init__(self) -> None:
+            self.answer_calls = []
+            self.publish_calls = []
+
+        def public_nation(self, nation, shards):
+            return ET.fromstring('<NATION id="oringrad"><FULLNAME>Oringrad</FULLNAME></NATION>')
+
+        def issues(self, nation):
+            return ET.fromstring(
+                '''
+                <NATION>
+                  <ISSUES>
+                    <ISSUE id="123">
+                      <TITLE>Robot Teachers</TITLE>
+                      <TEXT>Schools want robot teachers.</TEXT>
+                      <OPTION id="1">Regulate them.</OPTION>
+                    </ISSUE>
+                    <ISSUE id="456">
+                      <TITLE>Orbital Farms</TITLE>
+                      <TEXT>Farmers want orbital hydroponics grants.</TEXT>
+                      <OPTION id="1">Fund them.</OPTION>
+                    </ISSUE>
+                  </ISSUES>
+                </NATION>
+                '''
+            )
+
+        def answer_issue(self, nation, issue_id, option_id):
+            self.answer_calls.append((nation, issue_id, option_id))
+            return ET.fromstring('<NATION><ISSUE><OK>1</OK></ISSUE></NATION>')
+
+        def create_dispatch(self, nation, *, title, text, category, subcategory):
+            self.publish_calls.append((nation, title, text, category, subcategory))
+            return ET.fromstring(
+                '<NATION><ERROR>Your nation is attempting to issue many '
+                'announcements in a short period of time. Please wait for the '
+                'international press to catch their breath, then try again.'
+                '</ERROR></NATION>'
+            )
+
+    class FakeGovernor:
+        def __init__(self, *, base_url=None, model=None, api_key=None):
+            self.base_url = base_url or 'http://localhost:1234/v1'
+            self.model = model or 'test-model'
+
+        def plan_issue_order(self, **kwargs):
+            raise AssertionError('arrival order should skip AI ordering')
+
+        def advise(self, *, live_issues, **kwargs):
+            issue = live_issues[0]
+            issue_id = str(issue['issue_id'])
+            return {
+                **sample_recommendation(),
+                'issue_id': issue_id,
+                'option_id': '1',
+                'action': 'enact',
+                'confidence': 0.95,
+                'charter_alignment_score': 95,
+                'red_line_triggered': False,
+                'headline': f'Handle issue {issue_id}',
+                'model': self.model,
+                'dispatch_draft': {
+                    'requested': True,
+                    'title': f'Issue {issue_id} Update',
+                    'text': f'Policy update for issue {issue_id}.',
+                    'category_hint': 'Bulletin',
+                    'subcategory_hint': 'News',
+                },
+            }
+
+    fake_ns = FakeNationStatesClient()
+    monkeypatch.setattr(
+        live.NationStatesClient,
+        'from_env',
+        classmethod(lambda cls, nation_config=None: fake_ns),
+    )
+    monkeypatch.setattr(live, 'LocalGovernor', FakeGovernor)
+
+    args = advise_args(
+        tmp_path,
+        profile_path=profile_path,
+        draft_dispatch=True,
+    )
+    args.all_issues = True
+    args.auto = True
+    args.refresh_advice = True
+    args.flag_display = 'none'
+    args.issue_order = 'arrival'
+
+    run_advise(args)
+
+    output = capsys.readouterr().out
+    assert fake_ns.answer_calls == [
+        ('Oringrad', '123', '1'),
+        ('Oringrad', '456', '1'),
+    ]
+    assert [call[1] for call in fake_ns.publish_calls] == ['Issue 123 Update']
+    assert 'press to catch their breath' in output
+
+    audit_records = [
+        json.loads(line)
+        for line in (tmp_path / 'audit.jsonl').read_text(encoding='utf-8').splitlines()
+        if line.strip()
+    ]
+    assert [
+        record['recommendation']['issue_id']
+        for record in audit_records
+    ] == ['123', '456']
+    publication_results = [
+        record['publication_results'][0]
+        for record in audit_records
+    ]
+    assert [result['status'] for result in publication_results] == ['failed', 'blocked']
+    assert 'press to catch their breath' in publication_results[0]['error']
+    assert publication_results[1]['error'] == live.PUBLICATION_COOLDOWN_SKIP_MESSAGE
+
+
+def test_auto_reuses_unsafe_cached_advice_but_blocks_action(
     tmp_path,
     monkeypatch,
     capsys,
@@ -1630,15 +2461,17 @@ def test_auto_refreshes_unsafe_cached_advice_before_action(
     run_advise(args)
 
     output = capsys.readouterr().out
-    assert 'Cached advice for issue 123 cannot be reused' in output
-    assert 'cached advice is not safe for auto mode' in output
-    assert FakeGovernor.advise_calls == 1
-    assert fake_ns.answer_calls == [('Oringrad', '123', '2')]
+    assert 'Using cached advice for issue 123.' in output
+    assert 'AI step skipped: reused cached recommendation.' in output
+    assert 'Cached advice for issue 123 cannot be reused' not in output
+    assert 'AUTO ACTION BLOCKED' in output
+    assert FakeGovernor.advise_calls == 0
+    assert fake_ns.answer_calls == []
 
     audit_entry = json.loads((tmp_path / 'audit.jsonl').read_text(encoding='utf-8'))
-    assert audit_entry['action'] == 'auto_enact'
-    assert audit_entry['action_applied'] is True
-    assert audit_entry['blocked'] is False
+    assert audit_entry['action'] == 'requires_review'
+    assert audit_entry['action_applied'] is False
+    assert audit_entry['blocked'] is True
 
 
 def test_auto_validation_passes_for_valid_dismiss_without_publication() -> None:
@@ -1943,6 +2776,129 @@ def test_private_command_prepare_execute_flow() -> None:
     assert calls[1][0]['mode'] == 'execute'
     assert calls[1][0]['token'] == 'abc123'
     assert calls[1][0]['dispatch'] == 'add'
+
+
+def test_nationstates_api_trace_prints_redacted_exchange(capsys) -> None:
+    class FakeResponse:
+        status_code = 200
+        ok = True
+        headers = {
+            'X-Pin': 'pin-secret',
+            'RateLimit-Remaining': '9',
+        }
+        text = '<NATION><SUCCESS>abc123</SUCCESS><DATA>ok</DATA></NATION>'
+
+    class FakeSession:
+        def get(self, url, *, params, headers, timeout):
+            assert headers['X-Password'] == 'secret'
+            return FakeResponse()
+
+    client = NationStatesClient(
+        user_agent='NSAI-Test/0.1 contact:test@example.com nation:Oringrad',
+        password='secret',
+        api_trace=True,
+    )
+    client.session = FakeSession()  # type: ignore[assignment]
+
+    root = client.request_xml({'nation': 'Oringrad', 'q': 'issues'}, private=True)
+
+    output = capsys.readouterr().out
+    assert root.findtext('.//DATA') == 'ok'
+    assert 'API TRACE [NationStates]' in output
+    assert '"X-Password": "<redacted>"' in output
+    assert '"X-Pin": "<redacted>"' in output
+    assert 'pin-secret' not in output
+    assert 'secret' not in output
+    assert 'abc123' not in output
+
+
+def test_local_model_api_trace_prints_request_and_response(capsys) -> None:
+    class FakeCompletions:
+        def create(self, **kwargs):
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content='{"ok": true}'),
+                    ),
+                ],
+                usage=SimpleNamespace(total_tokens=3),
+            )
+
+    governor = LocalGovernor(
+        base_url='http://localhost:1234/v1',
+        model='test-model',
+        api_key='super-secret',
+        api_trace=True,
+    )
+    governor.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=FakeCompletions()),
+    )
+
+    governor._chat_completion_with_reload_retry(
+        step_name='trace test',
+        pulse_label=None,
+        model='test-model',
+        messages=[{'role': 'user', 'content': 'hello'}],
+        temperature=0,
+    )
+
+    output = capsys.readouterr().out
+    assert 'API TRACE [local model] chat.completions.create (trace test)' in output
+    assert '"step_name": "trace test"' in output
+    assert '"model": "test-model"' in output
+    assert '"content": "hello"' in output
+    assert '"total_tokens": 3' in output
+    assert 'super-secret' not in output
+
+
+def test_local_model_retries_without_temperature_when_provider_rejects_it(
+    capsys,
+) -> None:
+    class FakeCompletions:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def create(self, **kwargs):
+            self.calls.append(dict(kwargs))
+            if 'temperature' in kwargs:
+                raise RuntimeError(
+                    "Error code: 400 - {'error': {'message': "
+                    "\"Unsupported value: 'temperature' does not support 0.25 "
+                    'with this model. Only the default (1) value is supported."'
+                    "}}"
+                )
+
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content='{"ok": true}'),
+                    ),
+                ],
+            )
+
+    completions = FakeCompletions()
+    governor = LocalGovernor(
+        base_url='https://api.openai.com/v1',
+        model='gpt-5.6-terra',
+        api_key='test-key',
+    )
+    governor.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=completions),
+    )
+
+    governor._chat_completion_with_reload_retry(
+        step_name='temperature retry',
+        pulse_label=None,
+        model='gpt-5.6-terra',
+        messages=[{'role': 'user', 'content': 'hello'}],
+        temperature=0.25,
+    )
+
+    output = capsys.readouterr().out
+    assert len(completions.calls) == 2
+    assert completions.calls[0]['temperature'] == 0.25
+    assert 'temperature' not in completions.calls[1]
+    assert 'retrying with the provider default' in output
 
 
 def test_publish_publication_drafts_posts_dispatch_and_factbook() -> None:

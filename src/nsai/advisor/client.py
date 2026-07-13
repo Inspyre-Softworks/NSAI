@@ -13,6 +13,7 @@ from typing import Any
 import requests
 
 from nsai import __version__ as _NSAI_VERSION
+from nsai.advisor.trace import print_api_trace
 from nsai.nations import NationConfig
 from nsai.secure_store import (
     SECRET_BACKEND_KEYRING,
@@ -100,6 +101,7 @@ class NationStatesClient:
         autologin: str | None = None,
         pin: str | None = None,
         min_delay_seconds: float = 0.75,
+        api_trace: bool = False,
     ) -> None:
         if not user_agent or len(user_agent.strip()) < 8:
             raise ValueError(
@@ -113,6 +115,7 @@ class NationStatesClient:
         self.autologin = autologin
         self.pin = pin
         self.min_delay_seconds = min_delay_seconds
+        self.api_trace = api_trace
         self.last_request_at = 0.0
         self.rate_limit = RateLimitState()
         self.session = requests.Session()
@@ -227,6 +230,38 @@ class NationStatesClient:
         self.rate_limit.remaining = maybe_int(headers.get('RateLimit-Remaining'))
         self.rate_limit.reset_seconds = maybe_int(headers.get('RateLimit-Reset'))
 
+    def _trace_request_response(
+        self,
+        *,
+        method: str,
+        url: str,
+        request: dict[str, Any],
+        response: requests.Response | None = None,
+        error: BaseException | None = None,
+        stream: bool = False,
+    ) -> None:
+        if not self.api_trace:
+            return
+
+        response_payload: dict[str, Any] | None = None
+        if response is not None:
+            response_payload = {
+                'status_code': response.status_code,
+                'headers': dict(response.headers),
+            }
+            if stream:
+                response_payload['body'] = '<streaming response body not captured>'
+            else:
+                response_payload['body'] = response.text
+
+        print_api_trace(
+            api='NationStates',
+            operation=f'{method.upper()} {url}',
+            request=request,
+            response=response_payload,
+            error=error,
+        )
+
     def get_stream(
         self,
         url: str,
@@ -243,16 +278,39 @@ class NationStatesClient:
 
             headers = self._headers(private=private)
             headers['Accept'] = accept
+            request_payload = {
+                'method': 'GET',
+                'url': url,
+                'headers': headers,
+                'stream': True,
+            }
 
-            response = self.session.get(
-                url,
-                headers=headers,
-                stream=True,
-                timeout=timeout,
-            )
+            try:
+                response = self.session.get(
+                    url,
+                    headers=headers,
+                    stream=True,
+                    timeout=timeout,
+                )
+            except Exception as exc:
+                self._trace_request_response(
+                    method='GET',
+                    url=url,
+                    request=request_payload,
+                    error=exc,
+                    stream=True,
+                )
+                raise
 
             self.last_request_at = time.monotonic()
             self._record_headers(response)
+            self._trace_request_response(
+                method='GET',
+                url=url,
+                request=request_payload,
+                response=response,
+                stream=True,
+            )
 
             if response.status_code == 429:
                 response.close()
@@ -301,22 +359,60 @@ class NationStatesClient:
             self._sleep_if_needed()
 
             if method.upper() == 'POST':
-                response = self.session.post(
-                    NS_API_URL,
-                    data=clean_params,
-                    headers=self._headers(private=private),
-                    timeout=30,
-                )
+                headers = self._headers(private=private)
+                request_payload = {
+                    'method': 'POST',
+                    'url': NS_API_URL,
+                    'data': clean_params,
+                    'headers': headers,
+                }
+                try:
+                    response = self.session.post(
+                        NS_API_URL,
+                        data=clean_params,
+                        headers=headers,
+                        timeout=30,
+                    )
+                except Exception as exc:
+                    self._trace_request_response(
+                        method='POST',
+                        url=NS_API_URL,
+                        request=request_payload,
+                        error=exc,
+                    )
+                    raise
             else:
-                response = self.session.get(
-                    NS_API_URL,
-                    params=clean_params,
-                    headers=self._headers(private=private),
-                    timeout=30,
-                )
+                headers = self._headers(private=private)
+                request_payload = {
+                    'method': 'GET',
+                    'url': NS_API_URL,
+                    'params': clean_params,
+                    'headers': headers,
+                }
+                try:
+                    response = self.session.get(
+                        NS_API_URL,
+                        params=clean_params,
+                        headers=headers,
+                        timeout=30,
+                    )
+                except Exception as exc:
+                    self._trace_request_response(
+                        method='GET',
+                        url=NS_API_URL,
+                        request=request_payload,
+                        error=exc,
+                    )
+                    raise
 
             self.last_request_at = time.monotonic()
             self._record_headers(response)
+            self._trace_request_response(
+                method=method,
+                url=NS_API_URL,
+                request=request_payload,
+                response=response,
+            )
 
             if response.status_code == 429:
                 retry_after = maybe_int(response.headers.get('Retry-After')) or 5

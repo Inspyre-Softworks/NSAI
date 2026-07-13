@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from pydantic import BaseModel, ConfigDict, Field
+
 
 POLICY_AREAS = [
     'economy',
@@ -62,8 +64,17 @@ class Step:
     choices: list[str] | None = None
 
 
-@dataclass
-class GovernanceProfile:
+class GovernanceProfile(BaseModel):
+    """Schema for a completed governance profile.
+
+    ``extra='allow'`` because profile JSON on disk accumulates fields this
+    model doesn't declare (``ai_generated``, ``updated_at``) once
+    nsai.profile.enrichment appends AI-generated material after the
+    interview completes.
+    """
+
+    model_config = ConfigDict(extra='allow')
+
     profile_name: str
     nation_name: str
     created_at: str
@@ -77,7 +88,7 @@ class GovernanceProfile:
     unacceptable_tradeoffs: list[str]
     risk_tolerance: str
     enactment_mode: str
-    minimum_confidence_to_enact: float
+    minimum_confidence_to_enact: float = Field(ge=0.0, le=1.0)
     issue_selection_strategy: str
     tone: str
     custom_instruction: str

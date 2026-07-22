@@ -201,3 +201,120 @@ def test_environment_secret_overrides_saved_secret(monkeypatch) -> None:
 
     assert client.user_agent == 'env-user-agent'
     assert client.password == 'env-password'
+
+
+def test_nation_login_saves_autologin_and_replaces_password(
+    isolated_config_home,
+    monkeypatch,
+) -> None:
+    secrets: dict[str, str] = {}
+    deleted: list[str] = []
+    old_key = credential_key_for('Oringrad', 'password')
+    nations.save_nation_config(NationConfig(
+        nation_name='Oringrad',
+        user_agent='NSAI-Test/0.1 contact:test@example.com nation:Oringrad',
+        auth_kind='password',
+        credential_key=old_key,
+        credential_backend='keyring',
+    ))
+
+    class FakeClient:
+        def __init__(self, **kwargs) -> None:
+            assert kwargs['password'] == 'nation-password'
+            self.autologin = None
+            self.pin = None
+
+        def establish_session(self, nation: str) -> None:
+            assert nation == 'Oringrad'
+            self.pin = 'temporary-pin'
+            self.autologin = 'reusable-autologin'
+
+    monkeypatch.setattr('nsai.advisor.client.NationStatesClient', FakeClient)
+    monkeypatch.setattr(
+        nations,
+        'set_secret',
+        lambda key, value, **kwargs: secrets.__setitem__(key, value),
+    )
+    monkeypatch.setattr(
+        nations,
+        'delete_secret',
+        lambda key, **kwargs: deleted.append(key),
+    )
+    monkeypatch.setattr(nations.sys, 'stdin', io.StringIO('nation-password\n'))
+
+    nations.run_nation_login(argparse.Namespace(
+        nation='Oringrad',
+        user_agent=None,
+        password=False,
+        password_stdin=True,
+        secret_backend=None,
+    ))
+
+    new_key = credential_key_for('Oringrad', 'autologin')
+    config = load_nation_config('Oringrad')
+    assert config.auth_kind == 'autologin'
+    assert config.credential_key == new_key
+    assert config.credential_backend == 'keyring'
+    pin_key = credential_key_for('Oringrad', 'pin')
+    assert config.pin_credential_key == pin_key
+    assert secrets == {
+        new_key: 'reusable-autologin',
+        pin_key: 'temporary-pin',
+    }
+    assert deleted == [old_key]
+
+
+def test_client_prefers_cached_pin_from_nation_config(monkeypatch) -> None:
+    autologin_key = credential_key_for('Oringrad', 'autologin')
+    pin_key = credential_key_for('Oringrad', 'pin')
+    config = NationConfig(
+        nation_name='Oringrad',
+        user_agent='NSAI-Test/0.1 contact:test@example.com nation:Oringrad',
+        auth_kind='autologin',
+        credential_key=autologin_key,
+        pin_credential_key=pin_key,
+    )
+    secrets = {
+        autologin_key: 'reusable-autologin',
+        pin_key: 'cached-pin',
+    }
+
+    monkeypatch.delenv('NS_PASSWORD', raising=False)
+    monkeypatch.delenv('NS_AUTOLOGIN', raising=False)
+    monkeypatch.delenv('NS_PIN', raising=False)
+    monkeypatch.setattr(live, 'get_secret', lambda key, **kwargs: secrets[key])
+
+    client = NationStatesClient.from_env(config)
+
+    assert client.autologin == 'reusable-autologin'
+    assert client.pin == 'cached-pin'
+    assert client._headers(private=True)['X-Pin'] == 'cached-pin'
+
+
+def test_establish_session_captures_pin_and_autologin(monkeypatch) -> None:
+    client = NationStatesClient(
+        user_agent='NSAI-Test/0.1 contact:test@example.com nation:Oringrad',
+        password='secret',
+        min_delay_seconds=0,
+    )
+
+    class FakeResponse:
+        status_code = 200
+        ok = True
+        text = '<NATION><UNREAD>0</UNREAD></NATION>'
+        headers = {
+            'X-Pin': 'temporary-pin',
+            'X-Autologin': 'reusable-autologin',
+        }
+
+    def fake_get(url, *, params, headers, timeout):
+        assert params == {'nation': 'Oringrad', 'q': 'unread'}
+        assert headers['X-Password'] == 'secret'
+        return FakeResponse()
+
+    monkeypatch.setattr(client.session, 'get', fake_get)
+
+    client.establish_session('Oringrad')
+
+    assert client.pin == 'temporary-pin'
+    assert client.autologin == 'reusable-autologin'

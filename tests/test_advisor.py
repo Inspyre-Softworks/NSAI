@@ -12,7 +12,7 @@ from PIL import Image
 from rich.console import Console
 
 import nsai.advisor.live as live
-from nsai.advisor.audit import write_audit_log
+from nsai.advisor.audit import AuditStore, load_audit_log_records, migrate_jsonl_audit_log, write_audit_log
 from nsai.advisor.live import (
     NationStatesError,
     NationStatesClient,
@@ -158,7 +158,7 @@ def advise_args(tmp_path, *, profile_path, draft_dispatch=False, draft_factbook=
         show_issues=False,
         show_instruction=False,
         no_ai=False,
-        audit_log=str(tmp_path / 'audit.jsonl'),
+        audit_log=str(tmp_path / 'audit.sqlite3'),
         base_url='http://localhost:1234/v1',
         model='test-model',
         lm_api_key=None,
@@ -238,6 +238,7 @@ def test_fallback_recommendation_is_review_only() -> None:
     assert recommendation['factbook_draft']['requested'] is True
     assert recommendation['factbook_draft']['pertinent'] is False
     assert recommendation['factbook_draft']['reason']
+    assert recommendation['reasoning_matches_action'] is True
 
     allowed, reasons = should_manual_enact(
         recommendation=recommendation,
@@ -466,7 +467,7 @@ def test_advise_skips_ai_issue_selection_when_only_one_issue(
         show_issues=False,
         show_instruction=False,
         no_ai=False,
-        audit_log=str(tmp_path / 'audit.jsonl'),
+        audit_log=str(tmp_path / 'audit.sqlite3'),
         base_url='http://localhost:1234/v1',
         model='test-model',
         lm_api_key=None,
@@ -551,7 +552,7 @@ def test_advise_skips_flag_shard_when_flag_display_none(
         show_issues=False,
         show_instruction=False,
         no_ai=False,
-        audit_log=str(tmp_path / 'audit.jsonl'),
+        audit_log=str(tmp_path / 'audit.sqlite3'),
         base_url='http://localhost:1234/v1',
         model='test-model',
         lm_api_key=None,
@@ -695,7 +696,7 @@ def test_model_reload_issue_selection_retry_blocks_auto_action(
     assert fake_ns.answer_calls == []
     assert fake_ns.publish_calls == []
 
-    audit_entry = json.loads((tmp_path / 'audit.jsonl').read_text(encoding='utf-8'))
+    _, audit_entry = load_audit_log_records(tmp_path / 'audit.sqlite3')[0]
     assert audit_entry['action'] == 'requires_review'
     assert audit_entry['action_applied'] is False
     assert audit_entry['blocked'] is True
@@ -869,6 +870,53 @@ def test_auto_validation_blocks_zero_alignment_enact() -> None:
     assert any('positive alignment score' in reason for reason in result.reasons)
 
 
+def test_auto_validation_blocks_self_reported_reasoning_mismatch() -> None:
+    result = validate_auto_action(
+        live_issues=sample_issues(),
+        selected_issue=sample_issues()[0],
+        recommendation={
+            **sample_recommendation(),
+            'confidence': 0.92,
+            'charter_alignment_score': 92,
+            'red_line_triggered': False,
+            'reasoning_matches_action': False,
+        },
+        ai_step_statuses=[
+            {'step': 'issue_selection', 'status': 'ok'},
+            {'step': 'recommendation_generation', 'status': 'ok'},
+        ],
+        draft_dispatch=False,
+        draft_factbook=False,
+        minimum_confidence=0.8,
+    )
+
+    assert result.passed is False
+    assert any('reasoning_matches_action=false' in reason for reason in result.reasons)
+
+
+def test_auto_validation_ignores_missing_reasoning_matches_action() -> None:
+    """Cached/older recommendations predate this field; absence is not a block."""
+    result = validate_auto_action(
+        live_issues=sample_issues(),
+        selected_issue=sample_issues()[0],
+        recommendation={
+            **sample_recommendation(),
+            'confidence': 0.92,
+            'charter_alignment_score': 92,
+            'red_line_triggered': False,
+        },
+        ai_step_statuses=[
+            {'step': 'issue_selection', 'status': 'ok'},
+            {'step': 'recommendation_generation', 'status': 'ok'},
+        ],
+        draft_dispatch=False,
+        draft_factbook=False,
+        minimum_confidence=0.8,
+    )
+
+    assert result.passed is True
+
+
 def test_valid_auto_enact_calls_action_endpoint(
     tmp_path,
     monkeypatch,
@@ -937,7 +985,7 @@ def test_valid_auto_enact_calls_action_endpoint(
     assert 'Decision Summary' in output
     assert 'NationStates accepted the issue action.' in output
     assert fake_ns.answer_calls == [('Oringrad', '123', '2')]
-    audit_entry = json.loads((tmp_path / 'audit.jsonl').read_text(encoding='utf-8'))
+    _, audit_entry = load_audit_log_records(tmp_path / 'audit.sqlite3')[0]
     assert audit_entry['action'] == 'auto_enact'
     assert audit_entry['action_applied'] is True
     assert audit_entry['blocked'] is False
@@ -2229,19 +2277,15 @@ def test_all_issues_escape_monitor_is_active_during_prefetch(
 
 
 def test_cooldown_state_can_seed_from_recent_audit_log(tmp_path) -> None:
-    audit_log = tmp_path / 'audit.jsonl'
-    audit_log.write_text(
-        json.dumps({
-            'timestamp': datetime.now(timezone.utc).isoformat(),
-            'nation': 'Oringrad',
-            'action_applied': True,
-            'publication_results': [
-                {'kind': 'dispatch', 'status': 'posted'},
-            ],
-        })
-        + '\n',
-        encoding='utf-8',
-    )
+    audit_log = tmp_path / 'audit.sqlite3'
+    AuditStore(audit_log).append({
+        'timestamp': datetime.now(timezone.utc).isoformat(),
+        'nation': 'Oringrad',
+        'action_applied': True,
+        'publication_results': [
+            {'kind': 'dispatch', 'status': 'posted'},
+        ],
+    })
     publication_state = {'cooldown_hit': False, 'last_post_at': None}
     issue_state = {'last_action_at': None}
 
@@ -2260,27 +2304,23 @@ def test_cooldown_state_can_seed_from_recent_audit_log(tmp_path) -> None:
 
 
 def test_publication_cooldown_seed_counts_failed_attempts(tmp_path) -> None:
-    audit_log = tmp_path / 'audit.jsonl'
-    audit_log.write_text(
-        json.dumps({
-            'timestamp': datetime.now(timezone.utc).isoformat(),
-            'nation': 'Oringrad',
-            'action_applied': True,
-            'publication_results': [
-                {
-                    'kind': 'dispatch',
-                    'status': 'failed',
-                    'error': (
-                        'Your nation is attempting to issue many announcements '
-                        'in a short period of time. Please wait for the international '
-                        'press to catch their breath, then try again.'
-                    ),
-                },
-            ],
-        })
-        + '\n',
-        encoding='utf-8',
-    )
+    audit_log = tmp_path / 'audit.sqlite3'
+    AuditStore(audit_log).append({
+        'timestamp': datetime.now(timezone.utc).isoformat(),
+        'nation': 'Oringrad',
+        'action_applied': True,
+        'publication_results': [
+            {
+                'kind': 'dispatch',
+                'status': 'failed',
+                'error': (
+                    'Your nation is attempting to issue many announcements '
+                    'in a short period of time. Please wait for the international '
+                    'press to catch their breath, then try again.'
+                ),
+            },
+        ],
+    })
     publication_state = {'cooldown_hit': False, 'last_post_at': None}
     issue_state = {'last_action_at': None}
 
@@ -2533,9 +2573,8 @@ def test_all_issues_skips_later_publications_after_cooldown_error(
     assert 'press to catch their breath' in output
 
     audit_records = [
-        json.loads(line)
-        for line in (tmp_path / 'audit.jsonl').read_text(encoding='utf-8').splitlines()
-        if line.strip()
+        record
+        for _, record in load_audit_log_records(tmp_path / 'audit.sqlite3')
     ]
     assert [
         record['recommendation']['issue_id']
@@ -2643,7 +2682,7 @@ def test_auto_reuses_unsafe_cached_advice_but_blocks_action(
     assert FakeGovernor.advise_calls == 0
     assert fake_ns.answer_calls == []
 
-    audit_entry = json.loads((tmp_path / 'audit.jsonl').read_text(encoding='utf-8'))
+    _, audit_entry = load_audit_log_records(tmp_path / 'audit.sqlite3')[0]
     assert audit_entry['action'] == 'requires_review'
     assert audit_entry['action_applied'] is False
     assert audit_entry['blocked'] is True
@@ -3309,7 +3348,7 @@ def test_dismissal_recommendation_can_be_applied_with_guardrails() -> None:
 
 
 def test_write_audit_log(tmp_path) -> None:
-    path = tmp_path / 'audit.jsonl'
+    path = tmp_path / 'audit.sqlite3'
     profile_path = tmp_path / 'profile.json'
 
     write_audit_log(
@@ -3323,15 +3362,35 @@ def test_write_audit_log(tmp_path) -> None:
         result_xml=xml_to_string(ET.Element('OK')),
     )
 
-    lines = path.read_text(encoding='utf-8').splitlines()
-    assert len(lines) == 1
+    records = load_audit_log_records(path)
+    assert len(records) == 1
 
-    entry = json.loads(lines[0])
+    _, entry = records[0]
     assert entry['nation'] == 'Oringrad'
     assert entry['profile_path'] == str(profile_path)
     assert entry['action'] == 'advisor_only'
     assert entry['recommendation']['option_id'] == '2'
     assert entry['result_xml'] == '<OK />'
+
+
+def test_migrate_jsonl_audit_log_imports_without_touching_source(tmp_path) -> None:
+    jsonl_path = tmp_path / 'legacy_audit.jsonl'
+    db_path = tmp_path / 'audit.sqlite3'
+    lines = [
+        json.dumps({'timestamp': '2026-01-01T00:00:00+00:00', 'nation': 'Oringrad', 'action': 'advisor_only'}),
+        json.dumps({'timestamp': '2026-01-02T00:00:00+00:00', 'nation': 'Oringrad', 'action': 'manual_enact'}),
+    ]
+    jsonl_path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    original_jsonl_text = jsonl_path.read_text(encoding='utf-8')
+
+    count = migrate_jsonl_audit_log(jsonl_path, db_path)
+
+    assert count == 2
+    assert jsonl_path.read_text(encoding='utf-8') == original_jsonl_text
+
+    records = load_audit_log_records(db_path)
+    assert len(records) == 2
+    assert [entry['action'] for _, entry in records] == ['advisor_only', 'manual_enact']
 
 
 def test_save_advise_options_persists_defaults_and_managed_profile(

@@ -12,11 +12,13 @@ Author: Taylor B. | Inspyre-Softworks.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -438,7 +440,7 @@ class GovernanceProfileApp(App):
 
     def build_preview_text(self) -> str:
         profile = self.build_profile()
-        data = asdict(profile)
+        data = profile.model_dump(mode='json')
 
         lines = [
             '⚖ GOVERNANCE CHARTER PREVIEW',
@@ -463,7 +465,7 @@ class GovernanceProfileApp(App):
 
     def save_profile(self) -> Path:
         profile = self.build_profile()
-        profile_data = asdict(profile)
+        profile_data = profile.model_dump(mode='json')
 
         if self.enrich_on_save:
             enriched_profile_data = append_ai_generated_governance(

@@ -105,6 +105,7 @@ from nsai.advisor.audit import (  # noqa: F401
     append_publication_backfill_log,
     audit_issue_action_succeeded,
     load_audit_log_records,
+    migrate_jsonl_audit_log,
     pending_publication_entries,
     posted_publication_keys,
     publication_source_key,
@@ -142,6 +143,7 @@ from nsai.advisor.cli import (  # noqa: F401
     resolve_bool_option,
     resolve_nation_name,
     resolve_publication_category,
+    run_migrate_audit_log,
     run_publication_backfill,
     sleep_with_progress,
 )

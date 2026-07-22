@@ -373,6 +373,7 @@ def fallback_recommendation(
                 'audit_summary': (
                     f'Fallback selected dismissal for issue {issue["issue_id"]}.'
                 ),
+                'reasoning_matches_action': True,
                 'model': 'fallback',
                 'option_label_basis': 'website_position',
                 'fallback_recommendation_used': True,

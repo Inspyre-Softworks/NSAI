@@ -43,6 +43,19 @@ When `--profile` is provided, NSAI copies that profile into its managed profile 
 
 `--password` prompts securely. For automation, `--password-stdin` reads the secret from stdin. The secret is not written to the JSON config. Use `--lm-api-key` or `--lm-api-key-stdin` to store a local-model API key behind the same secret backend.
 
+To authenticate with your password once, obtain a temporary NationStates PIN, and
+save the resulting session credentials in the OS credential store:
+
+```powershell
+poetry run nsai nation login Oringrad --password
+```
+
+The password and returned PIN are never printed. The PIN and `X-Autologin` token are
+stored in the OS credential store, never in the JSON config. On later runs, NSAI
+reuses the cached `X-Pin` across separate commands, avoiding repeated logins and 409
+conflicts. When the PIN expires, run `nation login ... --password` again. You can run
+`nation login` without `--password` while the saved PIN is still valid to verify it.
+
 Inspect a saved config without revealing secrets:
 
 ```powershell

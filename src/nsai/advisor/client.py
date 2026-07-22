@@ -176,6 +176,16 @@ class NationStatesClient:
                 elif nation_config.auth_kind == 'pin':
                     pin = secret
 
+                if nation_config.pin_credential_key:
+                    try:
+                        pin = _get_secret(
+                            nation_config.pin_credential_key,
+                            backend=nation_config.credential_backend or SECRET_BACKEND_KEYRING,
+                            reason=f'Unlock NationStates PIN for {nation_config.nation_name}',
+                        ) or pin
+                    except SecureStoreError as exc:
+                        raise NationStatesError(str(exc)) from exc
+
         return cls(
             user_agent=user_agent,
             api_version=api_version,
@@ -362,6 +372,19 @@ class NationStatesClient:
             'nation': nation,
             'q': 'issues',
         }, private=True)
+
+    def establish_session(self, nation: str) -> None:
+        """Authenticate and capture the session credentials returned by NationStates."""
+
+        self.request_xml({
+            'nation': nation,
+            'q': 'unread',
+        }, private=True, retries=0)
+
+        if not self.pin:
+            raise NationStatesError(
+                'NationStates authenticated the request but did not return an X-Pin.'
+            )
 
     def answer_issue(self, nation: str, issue_id: str, option_id: str) -> ET.Element:
         return self.request_xml({

@@ -9,7 +9,7 @@ import os
 import re
 import shutil
 import sys
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -47,6 +47,7 @@ class NationConfig:
     draft_factbook: bool | None = None
     auth_kind: str | None = None
     credential_key: str | None = None
+    pin_credential_key: str | None = None
     credential_backend: str | None = None
     lm_api_key_backend: str | None = None
     config_version: int = CONFIG_VERSION
@@ -178,6 +179,7 @@ def load_nation_config(nation_name: str) -> NationConfig:
         draft_factbook=data.get('draft_factbook'),
         auth_kind=data.get('auth_kind'),
         credential_key=data.get('credential_key'),
+        pin_credential_key=data.get('pin_credential_key'),
         credential_backend=data.get('credential_backend'),
         lm_api_key_backend=data.get('lm_api_key_backend'),
         config_version=int(data.get('config_version', CONFIG_VERSION)),
@@ -378,6 +380,36 @@ def add_nation_arguments(subparsers: argparse._SubParsersAction) -> None:
     )
     set_parser.set_defaults(func=run_nation_set)
 
+    login_parser = nation_subparsers.add_parser(
+        'login',
+        help='Authenticate once and securely cache X-Pin plus X-Autologin.',
+    )
+    login_parser.add_argument('nation', help='NationStates nation name.')
+    login_parser.add_argument(
+        '--user-agent',
+        help='Informative NationStates API User-Agent to save for this nation.',
+    )
+    login_parser.add_argument(
+        '--password',
+        action='store_true',
+        help='Prompt securely for the nation password; the password is not saved.',
+    )
+    login_parser.add_argument(
+        '--password-stdin',
+        action='store_true',
+        help='Read the nation password from stdin; the password is not saved.',
+    )
+    login_parser.add_argument(
+        '--secret-backend',
+        choices=SECRET_BACKENDS,
+        default=None,
+        help=(
+            'Secret backend for the returned X-Pin and X-Autologin token. '
+            'Defaults to the existing backend, or windows-hello on Windows.'
+        ),
+    )
+    login_parser.set_defaults(func=run_nation_login)
+
     show_parser = nation_subparsers.add_parser(
         'show',
         help='Show a saved nation config without revealing secrets.',
@@ -438,8 +470,15 @@ def run_nation_set(args: argparse.Namespace) -> None:
                 backend=existing.credential_backend or SECRET_BACKEND_KEYRING,
                 reason=f'Delete NationStates secret for {args.nation}',
             )
+        if existing and existing.pin_credential_key:
+            delete_secret(
+                existing.pin_credential_key,
+                backend=existing.credential_backend or SECRET_BACKEND_KEYRING,
+                reason=f'Delete NationStates PIN for {args.nation}',
+            )
         auth_kind = None
         credential_key = None
+        pin_credential_key = None
         credential_backend = None
     else:
         credential_key = (
@@ -447,10 +486,18 @@ def run_nation_set(args: argparse.Namespace) -> None:
             if auth_kind
             else (existing.credential_key if existing else None)
         )
+        pin_credential_key = existing.pin_credential_key if existing else None
         credential_backend = existing.credential_backend if existing else None
 
     secret = read_secret_from_args(args, auth_kind or 'password')
     if secret is not None:
+        if existing and existing.pin_credential_key:
+            delete_secret(
+                existing.pin_credential_key,
+                backend=existing.credential_backend or SECRET_BACKEND_KEYRING,
+                reason=f'Delete stale NationStates PIN for {args.nation}',
+            )
+            pin_credential_key = None
         if not auth_kind or not credential_key:
             auth_kind = 'password'
             credential_key = credential_key_for(args.nation, auth_kind)
@@ -535,6 +582,7 @@ def run_nation_set(args: argparse.Namespace) -> None:
         ),
         auth_kind=auth_kind,
         credential_key=credential_key,
+        pin_credential_key=pin_credential_key,
         credential_backend=credential_backend,
         lm_api_key_backend=lm_api_key_backend,
     )
@@ -556,6 +604,108 @@ def run_nation_set(args: argparse.Namespace) -> None:
             f'{config.lm_api_key_credential_key} '
             f'({config.lm_api_key_backend or SECRET_BACKEND_KEYRING})'
         )
+
+
+def run_nation_login(args: argparse.Namespace) -> None:
+    """Create a NationStates session and securely persist its returned credentials."""
+
+    from nsai.advisor.client import (
+        NationStatesClient,
+        NationStatesError,
+        build_default_user_agent,
+    )
+
+    if args.password and args.password_stdin:
+        raise ValueError('Use either --password or --password-stdin, not both.')
+
+    existing = maybe_load_nation_config(args.nation)
+    password = read_secret_from_args(args, 'password')
+    user_agent = (
+        args.user_agent
+        or (existing.user_agent if existing else None)
+        or os.environ.get('NS_USER_AGENT')
+        or build_default_user_agent(args.nation)
+    )
+
+    if password is not None:
+        client = NationStatesClient(
+            user_agent=user_agent,
+            api_version=existing.api_version if existing else None,
+            password=password,
+        )
+    else:
+        lookup_config = existing or NationConfig(
+            nation_name=args.nation,
+            user_agent=user_agent,
+        )
+        client = NationStatesClient.from_env(lookup_config)
+
+    client.establish_session(args.nation)
+    if not client.autologin:
+        raise NationStatesError(
+            'NationStates returned an X-Pin but no reusable X-Autologin token. '
+            'Run this command with --password to create one.'
+        )
+
+    backend = (
+        args.secret_backend
+        or (existing.credential_backend if existing else None)
+        or default_secret_backend()
+    )
+    credential_key = credential_key_for(args.nation, 'autologin')
+    pin_credential_key = credential_key_for(args.nation, 'pin')
+    set_secret(
+        credential_key,
+        client.autologin,
+        backend=backend,
+        reason=f'Store NationStates autologin token for {args.nation}',
+    )
+    set_secret(
+        pin_credential_key,
+        client.pin,
+        backend=backend,
+        reason=f'Store NationStates PIN for {args.nation}',
+    )
+
+    if existing:
+        config = replace(
+            existing,
+            user_agent=user_agent,
+            auth_kind='autologin',
+            credential_key=credential_key,
+            pin_credential_key=pin_credential_key,
+            credential_backend=backend,
+        )
+    else:
+        config = NationConfig(
+            nation_name=args.nation,
+            user_agent=user_agent,
+            auth_kind='autologin',
+            credential_key=credential_key,
+            pin_credential_key=pin_credential_key,
+            credential_backend=backend,
+        )
+
+    save_nation_config(config)
+
+    old_key = existing.credential_key if existing else None
+    if old_key and old_key != credential_key:
+        delete_secret(
+            old_key,
+            backend=existing.credential_backend or SECRET_BACKEND_KEYRING,
+            reason=f'Delete replaced NationStates secret for {args.nation}',
+        )
+
+    print(f'NationStates login succeeded for {args.nation}.')
+    print('A fresh X-Pin was obtained and securely cached; it was not printed.')
+    print(
+        'Saved the reusable X-Autologin token in the OS credential store as: '
+        f'{credential_key} ({backend})'
+    )
+    print(
+        'NSAI will reuse the cached PIN across commands and retain X-Autologin '
+        'for the next explicit login refresh.'
+    )
 
 
 def nation_config_summary(config: NationConfig) -> dict[str, Any]:
@@ -602,6 +752,7 @@ def nation_config_summary(config: NationConfig) -> dict[str, Any]:
         'draft_dispatch': config.draft_dispatch,
         'draft_factbook': config.draft_factbook,
         'auth_kind': config.auth_kind,
+        'pin_configured': bool(config.pin_credential_key),
         'credential_backend': config.credential_backend,
         'lm_api_key_backend': config.lm_api_key_backend,
         'secret_configured': config.secret_configured,
@@ -645,6 +796,12 @@ def run_nation_remove(args: argparse.Namespace) -> None:
             config.credential_key,
             backend=config.credential_backend or SECRET_BACKEND_KEYRING,
             reason=f'Delete NationStates secret for {args.nation}',
+        )
+    if config and config.pin_credential_key and not args.keep_secret:
+        delete_secret(
+            config.pin_credential_key,
+            backend=config.credential_backend or SECRET_BACKEND_KEYRING,
+            reason=f'Delete NationStates PIN for {args.nation}',
         )
     if config and config.lm_api_key_credential_key and not args.keep_secret:
         delete_secret(

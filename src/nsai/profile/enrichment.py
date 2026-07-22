@@ -11,17 +11,26 @@ from typing import Any
 from openai import OpenAI
 
 
-LM_BASE_URL = os.environ.get('LM_STUDIO_BASE_URL', 'http://localhost:1234/v1')
-LM_MODEL = os.environ.get('LM_STUDIO_MODEL')
+DEFAULT_LM_BASE_URL = 'http://localhost:1234/v1'
+DEFAULT_LM_API_KEY = 'lm-studio'
+LM_BASE_URL = DEFAULT_LM_BASE_URL
+LM_MODEL = None
 
 
-def get_local_model_name(client: OpenAI) -> str:
+def get_local_model_name(client: OpenAI, *, model: str | None = None) -> str:
+    if model:
+        return model
+
+    env_model = os.environ.get('LM_STUDIO_MODEL')
+    if env_model:
+        return env_model
+
     models = client.models.list()
 
     if not models.data:
         raise RuntimeError('No local Studio model is loaded.')
 
-    return LM_MODEL or models.data[0].id
+    return models.data[0].id
 
 
 def get_completion_text(response: Any) -> str:
@@ -163,17 +172,27 @@ def validate_addendum(addendum: dict[str, Any]) -> None:
             raise ValueError(f'Article {index} missing text.')
 
 
-def generate_ai_governance_addendum(profile_data: dict[str, Any]) -> dict[str, Any]:
+def generate_ai_governance_addendum(
+    profile_data: dict[str, Any],
+    *,
+    base_url: str | None = None,
+    model: str | None = None,
+    api_key: str | None = None,
+) -> dict[str, Any]:
     """
     Send the completed interview/profile JSON to the local AI and ask it to append
     a vision description and short constitution.
     """
     client = OpenAI(
-        base_url=LM_BASE_URL,
-        api_key=os.environ.get('LM_STUDIO_API_KEY', 'lm-studio'),
+        base_url=(
+            base_url
+            or os.environ.get('LM_STUDIO_BASE_URL')
+            or DEFAULT_LM_BASE_URL
+        ),
+        api_key=api_key or os.environ.get('LM_STUDIO_API_KEY') or DEFAULT_LM_API_KEY,
     )
 
-    model = get_local_model_name(client)
+    model = get_local_model_name(client, model=model)
 
     system = """
 You are a political worldbuilding assistant for a NationStates AI governor.
@@ -298,6 +317,9 @@ def append_ai_generated_governance(
     *,
     force: bool = False,
     use_fallback: bool = True,
+    base_url: str | None = None,
+    model: str | None = None,
+    api_key: str | None = None,
 ) -> dict[str, Any]:
     """
     Append AI-generated vision/constitution material to the profile JSON.
@@ -312,9 +334,18 @@ def append_ai_generated_governance(
     # Use builder module's binding if available (supports monkeypatching in tests)
     _builder = sys.modules.get('nsai.profile.builder')
     _generate = getattr(_builder, 'generate_ai_governance_addendum', generate_ai_governance_addendum) if _builder else generate_ai_governance_addendum
+    generation_kwargs = {
+        key: value
+        for key, value in {
+            'base_url': base_url,
+            'model': model,
+            'api_key': api_key,
+        }.items()
+        if value is not None
+    }
 
     try:
-        addendum = _generate(profile_data)
+        addendum = _generate(profile_data, **generation_kwargs)
     except Exception as exc:
         if not use_fallback:
             raise

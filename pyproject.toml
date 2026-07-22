@@ -29,6 +29,10 @@ packages = [{ include = 'nsai', from = 'src' }]
 [tool.poetry.group.dev.dependencies]
 pytest = '>=8.0.0,<9.0.0'
 textual-dev = "^1.8.0"
+ipython = "^9.15.0"
+prompt-toolkit = "^3.0.52"
+ptipython = "^1.0.1"
+jupyterlab = "^4.6.2"
 
 [build-system]
 requires = ['poetry-core>=2.0.0,<3.0.0']

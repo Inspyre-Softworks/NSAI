@@ -96,6 +96,26 @@ Enrich an existing profile:
 poetry run nsai profile enrich .\oringrad_governance_profile.json
 ```
 
+Use an explicit OpenAI-compatible endpoint/model for enrichment:
+
+```powershell
+poetry run nsai profile enrich .\oringrad_governance_profile.json `
+  --base-url 'https://api.openai.com/v1' `
+  --model 'gpt-test'
+```
+
+Save profile-enrichment model defaults for later runs:
+
+```powershell
+poetry run nsai profile enrich .\oringrad_governance_profile.json `
+  --base-url 'http://localhost:1234/v1' `
+  --model 'local-model-name' `
+  --lm-api-key 'optional-key' `
+  --save-opts
+```
+
+`--save-opts` writes profile-enrichment defaults to NSAI's program `config.json`. Base URL and model are stored in the config file. If `--lm-api-key` is provided, the key is stored in the OS credential store and only a credential reference is written to config. Later `profile enrich` runs use command-line values first, then `LM_STUDIO_*` environment variables, then the saved profile-enrichment defaults.
+
 Preview a profile:
 
 ```powershell
@@ -103,6 +123,14 @@ poetry run nsai profile preview .\oringrad_governance_profile.json
 ```
 
 The preview command renders the profile with Rich tables and panels instead of dumping raw JSON.
+
+Build a profile automatically from public nation stats:
+
+```powershell
+poetry run nsai profile auto Oringrad
+```
+
+`profile auto` reads the nation's public NationStates data (category, freedom scores, government spending priorities, policies, and sensibilities) and derives a governance profile that matches the nation as it already is: spending shares become priority ordering, freedom scores become scoring weights, and low/negative stats stay low/negative instead of being treated as reform goals. The profile always starts in `advise_only` mode. Without a nation argument it falls back to `NS_NATION` or the saved default nation. Use `-o` to choose the output path and `--force` to overwrite; the default output is `<nation>_auto_profile.json`. The generated profile can then be previewed, enriched with `nsai profile enrich`, or attached with `nsai nation set --profile`.
 
 ## Live Advisor Commands
 
@@ -153,6 +181,22 @@ poetry run nsai advise --nation Oringrad --no-ai
 ```
 
 By default, the advisor stores issue choices, all-issue order plans, and per-issue advice in a SQLite cache under the NSAI config directory. If the same live issue IDs are present on a later run, NSAI reuses the saved "most important issue" choice. If `--all-issues` is used, NSAI asks the advisor to sort every live issue into a resolution order, caches that order, and then processes each issue in turn with progress bars. Use `--no-issue-ordering` or `--issue-order arrival` to skip the AI ordering step and keep the NationStates API issue order; use `--issue-id-order` or `--issue-order id` to process issues by ID number. If a later run has only the unresolved remainder from a cached order, NSAI reuses the larger cached plan and filters out issues that are no longer live. Press Escape during an all-issues run to cancel before the next issue action is submitted. If the chosen issue already has saved advice, NSAI reuses that recommendation instead of contacting the local AI again. If a new issue ID appears, the issue choice or order plan is recalculated, but saved advice for any selected issue ID is still reused. Pass `--parallel-requests N` with `--all-issues` to prefetch missing local-model recommendations with up to `N` parallel requests; NationStates issue actions are still applied sequentially in the cached order. Pass `--trace-api` to print redacted NationStates and local-model API requests and responses.
+
+Browse the latest cached active-issue decisions in an interactive Textual viewer:
+
+```powershell
+poetry run nsai advice list --nation Oringrad
+```
+
+Each issue appears in a collapsible card with the website-facing option number, full option text, rationale, confidence, model, cache source, and timestamp. Press `e` to expand every card, `c` to collapse them, and `q` to quit. The command is read-only and does not contact NationStates, unlock credentials, or call the local model. Omit `--nation` to use `NS_NATION` or the saved default nation. Use `--plain` for a non-interactive Rich report, or `--dev` to enable Textual devtools.
+
+To perform the live advising step and then review its decisions in the same TUI, run:
+
+```powershell
+poetry run nsai advise --nation Oringrad --tui
+```
+
+This mode gathers or reuses advice for every currently live issue before opening the viewer. Number keys `1` through `9` toggle the corresponding issue cards. Each card has an **Enact Option N** or **Dismiss issue** button followed by a confirmation dialog. Confirming returns the selected issue to the normal NSAI enactment path, which re-fetches the live issue and applies the existing option-ID validation, red-line/fallback guardrails, audit logging, publication rules, and NationStates response handling. The TUI refreshes the live issue/advice set after each request. Do not combine `--tui` with `--enact` or `--auto`; actions are selected inside the viewer.
 
 Each decision prints a short resolution and reasoning summary by default. Disable that extra summary with `--no-decision-summary`.
 

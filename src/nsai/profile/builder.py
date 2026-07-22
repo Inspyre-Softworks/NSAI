@@ -40,6 +40,8 @@ from nsai.profile.models import (  # noqa: F401
     Step,
 )
 from nsai.profile.enrichment import (  # noqa: F401
+    DEFAULT_LM_API_KEY,
+    DEFAULT_LM_BASE_URL,
     LM_BASE_URL,
     LM_MODEL,
     append_ai_generated_governance,
@@ -58,10 +60,20 @@ from nsai.profile.storage import (  # noqa: F401
     write_profile_json,
 )
 from nsai.help import NSAIArgumentParser
+from nsai.nations import load_app_config, save_app_config
+from nsai.secure_store import (
+    SECRET_BACKENDS,
+    SECRET_BACKEND_KEYRING,
+    SecureStoreError,
+    default_secret_backend,
+    get_secret,
+    set_secret,
+)
 
 
 TEXTUAL_FEATURES_ENV = 'TEXTUAL'
 TEXTUAL_DEVTOOLS_FEATURE = 'devtools'
+PROFILE_ENRICH_LM_API_KEY_CREDENTIAL_KEY = 'profile:enrich:lm-api-key'
 
 class GovernanceProfileApp(App):
     CSS = """
@@ -535,6 +547,116 @@ def add_textual_dev_argument(
     )
 
 
+def add_enrich_ai_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        '--base-url',
+        help=(
+            'OpenAI-compatible local model base URL. Overrides '
+            'LM_STUDIO_BASE_URL.'
+        ),
+    )
+    parser.add_argument(
+        '--model',
+        help=(
+            'OpenAI-compatible local model name. Overrides LM_STUDIO_MODEL. '
+            'If omitted, the first loaded model is used.'
+        ),
+    )
+    parser.add_argument(
+        '--lm-api-key',
+        help=(
+            'OpenAI-compatible local model API key for this run. Overrides '
+            'LM_STUDIO_API_KEY and is stored with --save-opts.'
+        ),
+    )
+    parser.add_argument(
+        '--secret-backend',
+        choices=SECRET_BACKENDS,
+        default=None,
+        help=(
+            'Secret backend for newly stored profile-enrich secrets with '
+            '--save-opts. Defaults to windows-hello on Windows, keyring '
+            'elsewhere.'
+        ),
+    )
+    parser.add_argument(
+        '--save-opts',
+        action='store_true',
+        default=argparse.SUPPRESS,
+        help=(
+            'Save current profile-enrich model options in the NSAI program '
+            'config; stores --lm-api-key only when provided.'
+        ),
+    )
+
+
+def resolve_enrich_lm_settings(args: argparse.Namespace) -> tuple[str, str | None, str]:
+    config = load_app_config()
+    base_url = (
+        getattr(args, 'base_url', None)
+        or os.environ.get('LM_STUDIO_BASE_URL')
+        or config.profile_enrich_lm_base_url
+        or DEFAULT_LM_BASE_URL
+    )
+    model = (
+        getattr(args, 'model', None)
+        or os.environ.get('LM_STUDIO_MODEL')
+        or config.profile_enrich_lm_model
+    )
+    api_key = getattr(args, 'lm_api_key', None) or os.environ.get('LM_STUDIO_API_KEY')
+
+    if not api_key and config.profile_enrich_lm_api_key_credential_key:
+        try:
+            api_key = get_secret(
+                config.profile_enrich_lm_api_key_credential_key,
+                backend=(
+                    config.profile_enrich_lm_api_key_backend
+                    or SECRET_BACKEND_KEYRING
+                ),
+                reason='Unlock profile enrichment LM API key',
+            )
+        except SecureStoreError as exc:
+            raise RuntimeError(str(exc)) from exc
+
+        if not api_key:
+            raise RuntimeError(
+                'Saved profile-enrich config references a missing LM API key '
+                f'secret: {config.profile_enrich_lm_api_key_credential_key}'
+            )
+
+    return base_url, model, api_key or DEFAULT_LM_API_KEY
+
+
+def save_enrich_options(
+    *,
+    lm_base_url: str,
+    lm_model: str | None,
+    lm_api_key: str | None,
+    secret_backend: str | None = None,
+) -> Path:
+    config = load_app_config()
+    config.profile_enrich_lm_base_url = lm_base_url
+    config.profile_enrich_lm_model = lm_model
+
+    if lm_api_key is not None:
+        config.profile_enrich_lm_api_key_credential_key = (
+            PROFILE_ENRICH_LM_API_KEY_CREDENTIAL_KEY
+        )
+        config.profile_enrich_lm_api_key_backend = (
+            secret_backend or default_secret_backend()
+        )
+        set_secret(
+            config.profile_enrich_lm_api_key_credential_key,
+            lm_api_key,
+            backend=config.profile_enrich_lm_api_key_backend,
+            reason='Store profile enrichment LM API key',
+        )
+
+    path = save_app_config(config)
+    print(f'Saved profile enrich options in program config: {path}')
+    return path
+
+
 def textual_features_with_devtools(features: str | None) -> str:
     enabled_features = [
         feature.strip()
@@ -576,6 +698,15 @@ def run_interview(args: argparse.Namespace) -> None:
 def run_enrich(args: argparse.Namespace) -> None:
     input_path = Path(args.profile).expanduser().resolve()
     output_path = Path(args.output).expanduser().resolve() if args.output else None
+    lm_base_url, lm_model, lm_api_key = resolve_enrich_lm_settings(args)
+
+    if bool(getattr(args, 'save_opts', False)):
+        save_enrich_options(
+            lm_base_url=lm_base_url,
+            lm_model=lm_model,
+            lm_api_key=getattr(args, 'lm_api_key', None),
+            secret_backend=getattr(args, 'secret_backend', None),
+        )
 
     print(f'Reading profile: {input_path}')
 
@@ -586,6 +717,9 @@ def run_enrich(args: argparse.Namespace) -> None:
         force=args.force,
         no_backup=args.no_backup,
         strict=args.strict,
+        base_url=lm_base_url,
+        model=lm_model,
+        api_key=lm_api_key,
     )
 
     print(f'Enriched profile written to: {target_path}')
@@ -802,6 +936,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action='store_true',
         help='Fail instead of using fallback text if the local AI fails.',
     )
+    add_enrich_ai_arguments(enrich_parser)
     enrich_parser.set_defaults(func=run_enrich)
 
     preview_parser = subparsers.add_parser(

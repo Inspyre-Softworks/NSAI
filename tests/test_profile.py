@@ -8,6 +8,7 @@ import pytest
 from rich.console import Console
 
 import nsai.profile.builder as profile_builder
+import nsai.profile.enrichment as profile_enrichment
 from nsai.profile.builder import (
     GovernanceProfileApp,
     Step,
@@ -93,6 +94,25 @@ def test_profile_builder_accepts_textual_dev_flag() -> None:
     assert implicit.dev is True
 
 
+def test_profile_enrich_accepts_ai_connection_options() -> None:
+    args = build_arg_parser().parse_args([
+        'enrich',
+        'profile.json',
+        '--base-url',
+        'https://api.openai.com/v1',
+        '--model',
+        'gpt-test',
+        '--lm-api-key',
+        'secret',
+        '--save-opts',
+    ])
+
+    assert args.base_url == 'https://api.openai.com/v1'
+    assert args.model == 'gpt-test'
+    assert args.lm_api_key == 'secret'
+    assert args.save_opts is True
+
+
 def test_run_interview_enables_textual_devtools(monkeypatch) -> None:
     recorded: dict[str, object] = {}
 
@@ -154,6 +174,116 @@ def test_profile_json_round_trip(tmp_path) -> None:
     assert default_enriched_path(path) == tmp_path / 'profile_enriched.json'
 
 
+def test_run_enrich_passes_ai_connection_options(tmp_path, monkeypatch) -> None:
+    recorded: dict[str, object] = {}
+    monkeypatch.setenv('NSAI_CONFIG_HOME', str(tmp_path / 'config-home'))
+
+    def fake_enrich_profile_file(input_path, **kwargs):  # noqa: ANN001
+        recorded['input_path'] = input_path
+        recorded.update(kwargs)
+        return kwargs['output_path']
+
+    monkeypatch.setattr(profile_builder, 'enrich_profile_file', fake_enrich_profile_file)
+
+    input_path = tmp_path / 'profile.json'
+    output_path = tmp_path / 'profile.enriched.json'
+    profile_builder.run_enrich(
+        argparse.Namespace(
+            profile=str(input_path),
+            output=str(output_path),
+            in_place=False,
+            force=True,
+            no_backup=False,
+            strict=True,
+            base_url='https://api.openai.com/v1',
+            model='gpt-test',
+            lm_api_key='secret',
+            secret_backend=None,
+        )
+    )
+
+    assert recorded['input_path'] == input_path.resolve()
+    assert recorded['output_path'] == output_path.resolve()
+    assert recorded['force'] is True
+    assert recorded['strict'] is True
+    assert recorded['base_url'] == 'https://api.openai.com/v1'
+    assert recorded['model'] == 'gpt-test'
+    assert recorded['api_key'] == 'secret'
+
+
+def test_save_enrich_options_persists_program_config_and_secret_ref(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv('NSAI_CONFIG_HOME', str(tmp_path / 'config-home'))
+    recorded: dict[str, object] = {}
+
+    def fake_set_secret(key, value, *, backend, reason):  # noqa: ANN001
+        recorded['key'] = key
+        recorded['value'] = value
+        recorded['backend'] = backend
+        recorded['reason'] = reason
+
+    monkeypatch.setattr(profile_builder, 'set_secret', fake_set_secret)
+
+    config_path = profile_builder.save_enrich_options(
+        lm_base_url='https://api.openai.com/v1',
+        lm_model='gpt-test',
+        lm_api_key='secret',
+        secret_backend='keyring',
+    )
+
+    saved_text = config_path.read_text(encoding='utf-8')
+    saved = json.loads(saved_text)
+    assert saved['profile_enrich_lm_base_url'] == 'https://api.openai.com/v1'
+    assert saved['profile_enrich_lm_model'] == 'gpt-test'
+    assert saved['profile_enrich_lm_api_key_credential_key'] == (
+        profile_builder.PROFILE_ENRICH_LM_API_KEY_CREDENTIAL_KEY
+    )
+    assert saved['profile_enrich_lm_api_key_backend'] == 'keyring'
+    assert 'secret' not in saved_text
+    assert recorded == {
+        'key': profile_builder.PROFILE_ENRICH_LM_API_KEY_CREDENTIAL_KEY,
+        'value': 'secret',
+        'backend': 'keyring',
+        'reason': 'Store profile enrichment LM API key',
+    }
+
+
+def test_resolve_enrich_lm_settings_uses_saved_program_config(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv('NSAI_CONFIG_HOME', str(tmp_path / 'config-home'))
+    monkeypatch.delenv('LM_STUDIO_BASE_URL', raising=False)
+    monkeypatch.delenv('LM_STUDIO_MODEL', raising=False)
+    monkeypatch.delenv('LM_STUDIO_API_KEY', raising=False)
+    monkeypatch.setattr(
+        profile_builder,
+        'set_secret',
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        profile_builder,
+        'get_secret',
+        lambda key, *, backend, reason: 'stored-secret',
+    )
+    profile_builder.save_enrich_options(
+        lm_base_url='https://api.openai.com/v1',
+        lm_model='gpt-test',
+        lm_api_key='secret',
+        secret_backend='keyring',
+    )
+
+    base_url, model, api_key = profile_builder.resolve_enrich_lm_settings(
+        argparse.Namespace(base_url=None, model=None, lm_api_key=None)
+    )
+
+    assert base_url == 'https://api.openai.com/v1'
+    assert model == 'gpt-test'
+    assert api_key == 'stored-secret'
+
+
 def test_addendum_validation_and_fallback(monkeypatch) -> None:
     addendum = fallback_ai_governance_addendum(sample_profile())
 
@@ -168,6 +298,78 @@ def test_addendum_validation_and_fallback(monkeypatch) -> None:
     profile = profile_builder.append_ai_generated_governance(sample_profile())
     assert profile['ai_generated']['generation_source'] == 'fallback'
     assert profile['ai_generated']['generation_warning'] == 'offline'
+
+
+def test_append_ai_generated_governance_passes_model_settings(monkeypatch) -> None:
+    recorded: dict[str, object] = {}
+
+    def fake_generate(profile_data, **kwargs):  # noqa: ANN001
+        recorded['profile_data'] = profile_data
+        recorded['kwargs'] = kwargs
+        return fallback_ai_governance_addendum(profile_data)
+
+    monkeypatch.setattr(profile_builder, 'generate_ai_governance_addendum', fake_generate)
+
+    profile_data = sample_profile()
+    enriched = profile_builder.append_ai_generated_governance(
+        profile_data,
+        base_url='https://api.openai.com/v1',
+        model='gpt-test',
+        api_key='secret',
+    )
+
+    assert recorded['profile_data'] == profile_data
+    assert recorded['kwargs'] == {
+        'base_url': 'https://api.openai.com/v1',
+        'model': 'gpt-test',
+        'api_key': 'secret',
+    }
+    assert enriched['ai_generated']['generation_source'] == 'fallback'
+
+
+def test_generate_ai_governance_addendum_uses_explicit_model_settings(monkeypatch) -> None:
+    recorded: dict[str, object] = {}
+    addendum = fallback_ai_governance_addendum(sample_profile())
+    addendum.pop('generation_source', None)
+
+    class FakeMessage:
+        content = json.dumps(addendum)
+
+    class FakeChoice:
+        message = FakeMessage()
+
+    class FakeResponse:
+        choices = [FakeChoice()]
+
+    class FakeCompletions:
+        def create(self, **kwargs):  # noqa: ANN001
+            recorded['chat_kwargs'] = kwargs
+            return FakeResponse()
+
+    class FakeChat:
+        completions = FakeCompletions()
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):  # noqa: ANN001
+            recorded['client_kwargs'] = kwargs
+            self.chat = FakeChat()
+
+    monkeypatch.setattr(profile_enrichment, 'OpenAI', FakeOpenAI)
+
+    generated = profile_enrichment.generate_ai_governance_addendum(
+        sample_profile(),
+        base_url='https://api.openai.com/v1',
+        model='gpt-test',
+        api_key='secret',
+    )
+
+    assert recorded['client_kwargs'] == {
+        'base_url': 'https://api.openai.com/v1',
+        'api_key': 'secret',
+    }
+    assert recorded['chat_kwargs']['model'] == 'gpt-test'
+    assert generated['generation_source'] == 'local_ai'
+    assert generated['model'] == 'gpt-test'
 
 
 def test_addendum_validation_rejects_bad_shape() -> None:

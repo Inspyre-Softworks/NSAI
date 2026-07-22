@@ -374,6 +374,7 @@ def fallback_recommendation(
                     f'Fallback selected dismissal for issue {issue["issue_id"]}.'
                 ),
                 'model': 'fallback',
+                'option_label_basis': 'website_position',
                 'fallback_recommendation_used': True,
                 'requires_review': True,
             }

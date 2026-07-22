@@ -65,6 +65,10 @@ class NationConfig:
 @dataclass
 class AppConfig:
     default_nation: str | None = None
+    profile_enrich_lm_base_url: str | None = None
+    profile_enrich_lm_model: str | None = None
+    profile_enrich_lm_api_key_credential_key: str | None = None
+    profile_enrich_lm_api_key_backend: str | None = None
     config_version: int = CONFIG_VERSION
     updated_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
@@ -130,6 +134,14 @@ def load_app_config() -> AppConfig:
     data = json.loads(path.read_text(encoding='utf-8'))
     return AppConfig(
         default_nation=data.get('default_nation'),
+        profile_enrich_lm_base_url=data.get('profile_enrich_lm_base_url'),
+        profile_enrich_lm_model=data.get('profile_enrich_lm_model'),
+        profile_enrich_lm_api_key_credential_key=data.get(
+            'profile_enrich_lm_api_key_credential_key'
+        ),
+        profile_enrich_lm_api_key_backend=data.get(
+            'profile_enrich_lm_api_key_backend'
+        ),
         config_version=int(data.get('config_version', CONFIG_VERSION)),
         updated_at=str(data.get('updated_at') or datetime.now(timezone.utc).isoformat()),
     )

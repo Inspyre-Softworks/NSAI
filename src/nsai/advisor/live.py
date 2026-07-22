@@ -875,7 +875,8 @@ def prefetch_issue_advice(
     console.print(
         f'Prefetching missing advice: {len(issues_to_prefetch)}/'
         f'{len(ordered_issue_ids)} issue(s), {worker_count} worker(s), '
-        f'{len(cached_issue_ids)} cached, requested {parallel_requests}.'
+        f'{len(cached_issue_ids)} cached, requested {parallel_requests}.',
+        highlight=False,
     )
 
     def request_advice(issue: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -1147,6 +1148,14 @@ def run_all_issues(
 
 
 def run_advise(args: argparse.Namespace) -> None:
+    if bool(getattr(args, 'tui', False)) and not bool(
+        getattr(args, '_tui_child', False)
+    ):
+        from nsai.advisor.cached_advice import run_advisor_tui
+
+        run_advisor_tui(args)
+        return
+
     save_opts = bool(getattr(args, 'save_opts', False))
     api_trace = bool(getattr(args, 'trace_api', False))
     publication_state = getattr(args, '_publication_state', None)

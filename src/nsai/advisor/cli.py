@@ -877,6 +877,21 @@ def add_advise_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
     parser.add_argument(
+        '--tui',
+        action='store_true',
+        help=(
+            'Advise on all live issues, then open the interactive Textual '
+            'decision viewer with guarded per-issue action buttons.'
+        ),
+    )
+
+    parser.add_argument(
+        '--dev',
+        action='store_true',
+        help='Enable Textual devtools when --tui is used.',
+    )
+
+    parser.add_argument(
         '--draft-dispatch',
         action=argparse.BooleanOptionalAction,
         default=None,

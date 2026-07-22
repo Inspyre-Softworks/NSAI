@@ -304,6 +304,7 @@ def test_ai_prompt_context_is_compact_and_clear() -> None:
     assert len(nation_context['legislation']) <= live.PROMPT_LONG_TEXT_LIMIT
     assert issues[0]['issue_id'] == '123'
     assert issues[0]['options'][0]['option_id'] == '2'
+    assert issues[0]['options'][0]['option_label'] == 'Option 1'
     assert len(issues[0]['text']) <= live.PROMPT_LONG_TEXT_LIMIT
 
 

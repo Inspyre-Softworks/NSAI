@@ -52,6 +52,9 @@ def enrich_profile_file(
     force: bool = False,
     no_backup: bool = False,
     strict: bool = False,
+    base_url: str | None = None,
+    model: str | None = None,
+    api_key: str | None = None,
 ) -> Path:
     profile_data = load_profile_json(input_path)
 
@@ -64,6 +67,9 @@ def enrich_profile_file(
         profile_data,
         force=force,
         use_fallback=not strict,
+        base_url=base_url,
+        model=model,
+        api_key=api_key,
     )
 
     if in_place:

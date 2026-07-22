@@ -391,12 +391,16 @@ def compact_live_issues_for_ai(
             'options': [
                 {
                     'option_id': str(option.get('option_id', '')),
+                    'option_label': f'Option {position}',
                     'text': compact_prompt_text(
                         option.get('text'),
                         limit=PROMPT_LONG_TEXT_LIMIT,
                     ),
                 }
-                for option in issue.get('options', [])
+                for position, option in enumerate(
+                    issue.get('options', []),
+                    start=1,
+                )
                 if isinstance(option, dict)
             ],
         })
@@ -943,12 +947,23 @@ Rules:
 - Never write that the nation is dismissing, accepting, or resolving an issue "with Option N".
 - Do not invent IDs.
 - Do not leave issue_id blank.
+- Option identity is strict: copy option_id exactly for machine actions. The
+  human-facing option_label is the option's numbered position on the NationStates
+  website and may differ from option_id when raw IDs contain gaps. Whenever you
+  mention an option in prose, use its listed option_label, never its raw option_id.
+- option_summaries must use the exact option_id values from the selected issue,
+  in the same order the options are listed.
 - issue_summary must summarize the selected issue in plain language.
 - option_summaries must summarize every available option for the selected issue.
 - If publication_requests.dispatch is true, dispatch_draft must contain a usable
   BBCode-friendly title and body text about the recommended issue action.
   Use category_hint "Bulletin" and a subcategory_hint of "News", "Policy",
   "Opinion", or "Campaign".
+- dispatch_draft must read like a release from the nation's state media: a
+  formal news bulletin announcing the government's action or position. Where
+  the issue text or its options quote named individuals arguing a side, quote
+  those individuals (with attribution) in the dispatch, preferring voices that
+  support the chosen action and optionally one dissenting voice for balance.
 - If publication_requests.factbook is true, decide whether the issue action is
   pertinent to durable national lore, institutions, laws, or statistics. If yes,
   factbook_draft must contain a usable title and body text. If no, set pertinent
@@ -957,6 +972,13 @@ Rules:
   "Overview", "History", "Geography", "Culture", "Politics", "Legislation",
   "Religion", "Military", "Economy", "International", "Trivia", or
   "Miscellaneous".
+- factbook_draft must read like an objective reference text: a neutral,
+  textbook-like third-person record of the nation's institutions, laws, or
+  history. No rhetoric, no promotion, no first-person voice, no quotes.
+- Publication drafts are in-world documents for NationStates readers. Never
+  mention the issue ID, option IDs or option numbers, this advisory process,
+  or that an "issue" was chosen, enacted, or dismissed. Describe the policy or
+  event itself, not the game mechanics behind it.
 - Publication drafts may be posted through the NationStates API after NSAI
   successfully enacts or dismisses the issue. Do not claim they were posted
   inside the draft text.
@@ -1284,6 +1306,7 @@ Rules:
 
         recommendation['model'] = self.model
         recommendation['token_usage'] = extract_token_usage(response)
+        recommendation['option_label_basis'] = 'website_position'
         if structured_output_repaired:
             recommendation['structured_output_repaired'] = True
         return recommendation

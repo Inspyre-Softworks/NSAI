@@ -278,6 +278,25 @@ class AdviceCache:
 
         return self._cached_issue_plan_from_row(row)
 
+    def get_latest_issue_plan(self, nation: str) -> CachedIssuePlan | None:
+        """Return the newest cached active-issue snapshot for a nation."""
+        with self.connect() as connection:
+            row = connection.execute(
+                '''
+                SELECT *
+                FROM issue_plans
+                WHERE nation = ?
+                ORDER BY updated_at DESC
+                LIMIT 1
+                ''',
+                (nation,),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        return self._cached_issue_plan_from_row(row)
+
     def get_covering_issue_plan(
         self,
         nation: str,

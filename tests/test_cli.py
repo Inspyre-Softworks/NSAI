@@ -43,6 +43,7 @@ def test_cli_help_surfaces_commands(capsys) -> None:
     assert 'profile' in output
     assert 'check' in output
     assert 'advise' in output
+    assert 'advice' in output
     assert 'publications' in output
     assert 'nation' in output
     assert 'world' in output
@@ -57,6 +58,17 @@ def test_cli_subcommand_help_surfaces_shapes(capsys) -> None:
     assert 'interview' in profile_output
     assert 'enrich' in profile_output
     assert 'preview' in profile_output
+
+    with pytest.raises(SystemExit) as exc:
+        build_parser().parse_args(['profile', 'enrich', '--help'])
+
+    assert exc.value.code == 0
+    enrich_output = capsys.readouterr().out
+    assert '--base-url' in enrich_output
+    assert '--model' in enrich_output
+    assert '--lm-api-key' in enrich_output
+    assert '--secret-backend' in enrich_output
+    assert '--save-opts' in enrich_output
 
     with pytest.raises(SystemExit) as exc:
         build_parser().parse_args(['profile', 'interview', '--help'])
@@ -92,6 +104,17 @@ def test_cli_subcommand_help_surfaces_shapes(capsys) -> None:
     assert '--publication-cooldown-seconds' in advise_output
     assert '--issue-cooldown-seconds' in advise_output
     assert '--decision-summary' in advise_output
+    assert '--tui' in advise_output
+    assert '--dev' in advise_output
+
+    with pytest.raises(SystemExit) as exc:
+        build_parser().parse_args(['advice', 'list', '--help'])
+
+    assert exc.value.code == 0
+    advice_list_output = capsys.readouterr().out
+    assert '--nation' in advice_list_output
+    assert '--plain' in advice_list_output
+    assert '--dev' in advice_list_output
 
     with pytest.raises(SystemExit) as exc:
         build_parser().parse_args(['check', '--help'])
@@ -175,9 +198,23 @@ def test_cli_version(capsys) -> None:
 def test_global_save_opts_can_be_placed_before_or_after_advise() -> None:
     before = build_parser().parse_args(['--save-opts', 'advise', '--nation', 'Oringrad'])
     after = build_parser().parse_args(['advise', '--nation', 'Oringrad', '--save-opts'])
+    enrich_before = build_parser().parse_args([
+        '--save-opts',
+        'profile',
+        'enrich',
+        'profile.json',
+    ])
+    enrich_after = build_parser().parse_args([
+        'profile',
+        'enrich',
+        'profile.json',
+        '--save-opts',
+    ])
 
     assert before.save_opts is True
     assert after.save_opts is True
+    assert enrich_before.save_opts is True
+    assert enrich_after.save_opts is True
 
 
 def test_check_issues_command_parses() -> None:

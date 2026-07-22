@@ -14,9 +14,12 @@ from nsai.advisor.live import (
     run_advise,
     run_check_issues,
 )
+from nsai.advisor.cached_advice import add_advice_arguments
 from nsai.nations import add_nation_arguments
 from nsai.world_dataset import add_world_arguments
+from nsai.profile.auto import add_auto_profile_arguments, run_auto
 from nsai.profile.builder import (
+    add_enrich_ai_arguments,
     add_textual_dev_argument,
     run_enrich,
     run_interview,
@@ -94,6 +97,7 @@ def build_parser() -> argparse.ArgumentParser:
         action='store_true',
         help='Fail instead of using fallback text if the local AI fails.',
     )
+    add_enrich_ai_arguments(enrich_parser)
     enrich_parser.set_defaults(func=run_enrich)
 
     preview_parser = profile_subparsers.add_parser(
@@ -106,12 +110,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     preview_parser.set_defaults(func=run_preview)
 
+    auto_parser = profile_subparsers.add_parser(
+        'auto',
+        help='Build a governance profile automatically from public nation stats.',
+    )
+    add_auto_profile_arguments(auto_parser)
+    auto_parser.set_defaults(func=run_auto)
+
     advise_parser = subparsers.add_parser(
         'advise',
         help='Recommend, audit, and optionally enact a live NationStates issue choice.',
     )
     add_advise_arguments(advise_parser)
     advise_parser.set_defaults(func=run_advise)
+
+    add_advice_arguments(subparsers)
 
     check_parser = subparsers.add_parser(
         'check',
@@ -178,6 +191,15 @@ def _run(argv: list[str] | None = None) -> None:
             if isinstance(action, argparse._SubParsersAction)
         ).choices['publications']
         publications_parser.print_help()
+        return
+
+    if args.command == 'advice' and args.advice_command is None:
+        advice_parser = next(
+            action
+            for action in parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        ).choices['advice']
+        advice_parser.print_help()
         return
 
     if args.command == 'check' and args.check_command is None:

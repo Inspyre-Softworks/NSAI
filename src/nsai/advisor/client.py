@@ -8,7 +8,7 @@ import sys
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import requests
 
@@ -19,6 +19,7 @@ from nsai.secure_store import (
     SECRET_BACKEND_KEYRING,
     SecureStoreError,
     get_secret,
+    set_secret,
 )
 
 
@@ -100,6 +101,7 @@ class NationStatesClient:
         password: str | None = None,
         autologin: str | None = None,
         pin: str | None = None,
+        pin_update_callback: Callable[[str], None] | None = None,
         min_delay_seconds: float = 0.75,
         api_trace: bool = False,
     ) -> None:
@@ -114,6 +116,7 @@ class NationStatesClient:
         self.password = password
         self.autologin = autologin
         self.pin = pin
+        self.pin_update_callback = pin_update_callback
         self.min_delay_seconds = min_delay_seconds
         self.api_trace = api_trace
         self.last_request_at = 0.0
@@ -150,6 +153,7 @@ class NationStatesClient:
         password = os.environ.get('NS_PASSWORD')
         autologin = os.environ.get('NS_AUTOLOGIN')
         pin = os.environ.get('NS_PIN')
+        pin_update_callback: Callable[[str], None] | None = None
 
         if nation_config and not any([password, autologin, pin]):
             credential_key = nation_config.credential_key
@@ -180,14 +184,40 @@ class NationStatesClient:
                     pin = secret
 
                 if nation_config.pin_credential_key:
+                    pin_credential_key = nation_config.pin_credential_key
+                    credential_backend = (
+                        nation_config.credential_backend or SECRET_BACKEND_KEYRING
+                    )
                     try:
                         pin = _get_secret(
-                            nation_config.pin_credential_key,
-                            backend=nation_config.credential_backend or SECRET_BACKEND_KEYRING,
+                            pin_credential_key,
+                            backend=credential_backend,
                             reason=f'Unlock NationStates PIN for {nation_config.nation_name}',
                         ) or pin
                     except SecureStoreError as exc:
                         raise NationStatesError(str(exc)) from exc
+
+                    def persist_refreshed_pin(
+                        refreshed_pin: str,
+                        *,
+                        key: str = pin_credential_key,
+                        backend: str = credential_backend,
+                        nation_name: str = nation_config.nation_name,
+                    ) -> None:
+                        _live = sys.modules.get('nsai.advisor.live')
+                        _set_secret = (
+                            getattr(_live, 'set_secret', set_secret)
+                            if _live
+                            else set_secret
+                        )
+                        _set_secret(
+                            key,
+                            refreshed_pin,
+                            backend=backend,
+                            reason=f'Refresh NationStates PIN for {nation_name}',
+                        )
+
+                    pin_update_callback = persist_refreshed_pin
 
         return cls(
             user_agent=user_agent,
@@ -195,6 +225,7 @@ class NationStatesClient:
             password=password,
             autologin=autologin,
             pin=pin,
+            pin_update_callback=pin_update_callback,
         )
 
     def _headers(self, private: bool = False) -> dict[str, str]:
@@ -233,7 +264,19 @@ class NationStatesClient:
     def _record_headers(self, response: requests.Response) -> None:
         headers = response.headers
 
-        self.pin = headers.get('X-Pin', self.pin)
+        previous_pin = self.pin
+        returned_pin = headers.get('X-Pin')
+        if returned_pin:
+            self.pin = returned_pin
+            if returned_pin != previous_pin and self.pin_update_callback is not None:
+                try:
+                    self.pin_update_callback(returned_pin)
+                except SecureStoreError as exc:
+                    print(
+                        f'WARNING: Could not securely persist refreshed NationStates '
+                        f'PIN: {exc}',
+                        file=sys.stderr,
+                    )
         self.autologin = headers.get('X-Autologin', self.autologin)
 
         self.rate_limit.limit = maybe_int(headers.get('RateLimit-Limit'))
@@ -365,6 +408,7 @@ class NationStatesClient:
         if self.api_version is not None:
             clean_params['v'] = self.api_version
 
+        stale_pin_retried = False
         for attempt in range(retries + 1):
             self._sleep_if_needed()
 
@@ -431,6 +475,27 @@ class NationStatesClient:
                     continue
 
             if response.status_code == 403:
+                used_cached_pin = private and 'X-Pin' in headers
+                has_fallback_credential = bool(self.autologin or self.password)
+                if (
+                    used_cached_pin
+                    and has_fallback_credential
+                    and not stale_pin_retried
+                    and attempt < retries
+                ):
+                    # PINs can expire while the reusable autologin/password remains
+                    # valid. Retry once without the stale PIN so NationStates can
+                    # issue a fresh one instead of surfacing a misleading UA error.
+                    self.pin = None
+                    stale_pin_retried = True
+                    continue
+                if private:
+                    raise NationStatesError(
+                        'NationStates returned 403 Forbidden for a private request. '
+                        'The saved session credential may have expired; run '
+                        '`nsai nation login <nation>` to refresh it. If login also '
+                        'fails, check NS_USER_AGENT.'
+                    )
                 raise NationStatesError(
                     'NationStates returned 403 Forbidden. Check your NS_USER_AGENT.'
                 )

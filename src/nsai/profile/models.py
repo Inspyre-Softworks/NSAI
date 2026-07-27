@@ -83,6 +83,7 @@ class GovernanceProfile(BaseModel):
     governing_style: str
     top_priorities: list[str]
     secondary_priorities: list[str]
+    concerns: list[str] = Field(default_factory=list)
     red_lines: list[str]
     preferred_tradeoffs: list[str]
     unacceptable_tradeoffs: list[str]
@@ -191,7 +192,17 @@ STEPS = [
     Step(
         key='risk_tolerance',
         title='Risk Tolerance',
-        help_text='Choose a risk level by typing the number or exact value.',
+        help_text=(
+            'How willing should the AI governor be to accept uncertain, disruptive, or '
+            'hard-to-reverse outcomes? This guides its recommendations; it does not bypass '
+            'enactment safeguards.\n\n'
+            '1. very_cautious — avoid major uncertainty and prefer proven, reversible choices\n'
+            '2. cautious — accept limited risk when the likely benefit is clear\n'
+            '3. balanced — weigh risk and reward without strongly favoring either\n'
+            '4. bold — accept substantial risk for important long-term gains\n'
+            '5. chaotic — embrace unpredictable or extreme outcomes for roleplay\n\n'
+            'Type the number or exact value.'
+        ),
         kind='choice',
         choices=RISK_LEVELS,
         default='balanced',

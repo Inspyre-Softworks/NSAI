@@ -58,6 +58,7 @@ def test_cli_subcommand_help_surfaces_shapes(capsys) -> None:
     assert 'interview' in profile_output
     assert 'enrich' in profile_output
     assert 'preview' in profile_output
+    assert 'concern' in profile_output
 
     with pytest.raises(SystemExit) as exc:
         build_parser().parse_args(['profile', 'enrich', '--help'])

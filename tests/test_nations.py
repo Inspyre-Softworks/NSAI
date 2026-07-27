@@ -291,6 +291,119 @@ def test_client_prefers_cached_pin_from_nation_config(monkeypatch) -> None:
     assert client._headers(private=True)['X-Pin'] == 'cached-pin'
 
 
+def test_private_request_retries_stale_pin_with_reusable_autologin(monkeypatch) -> None:
+    client = NationStatesClient(
+        user_agent='NSAI-Test/0.1 contact:test@example.com nation:Oringrad',
+        autologin='reusable-autologin',
+        pin='stale-pin',
+        min_delay_seconds=0,
+    )
+    request_headers: list[dict[str, str]] = []
+
+    class FakeResponse:
+        def __init__(
+            self,
+            status_code: int,
+            text: str,
+            headers: dict[str, str] | None = None,
+        ) -> None:
+            self.status_code = status_code
+            self.ok = status_code == 200
+            self.text = text
+            self.headers = headers or {}
+
+    responses = iter([
+        FakeResponse(403, '<ERROR>Invalid PIN</ERROR>'),
+        FakeResponse(
+            200,
+            '<NATION><ISSUES /></NATION>',
+            {'X-Pin': 'fresh-pin'},
+        ),
+    ])
+
+    def fake_get(url, *, params, headers, timeout):
+        request_headers.append(headers.copy())
+        return next(responses)
+
+    monkeypatch.setattr(client.session, 'get', fake_get)
+
+    result = client.issues('Oringrad')
+
+    assert result.tag == 'NATION'
+    assert request_headers[0]['X-Pin'] == 'stale-pin'
+    assert 'X-Autologin' not in request_headers[0]
+    assert request_headers[1]['X-Autologin'] == 'reusable-autologin'
+    assert 'X-Pin' not in request_headers[1]
+    assert client.pin == 'fresh-pin'
+
+
+def test_saved_session_persists_fresh_pin_after_stale_pin_retry(monkeypatch) -> None:
+    autologin_key = credential_key_for('Oringrad', 'autologin')
+    pin_key = credential_key_for('Oringrad', 'pin')
+    config = NationConfig(
+        nation_name='Oringrad',
+        user_agent='NSAI-Test/0.1 contact:test@example.com nation:Oringrad',
+        auth_kind='autologin',
+        credential_key=autologin_key,
+        pin_credential_key=pin_key,
+        credential_backend='keyring',
+    )
+    secrets = {
+        autologin_key: 'reusable-autologin',
+        pin_key: 'stale-pin',
+    }
+    saved: list[tuple[str, str, str, str]] = []
+
+    monkeypatch.delenv('NS_PASSWORD', raising=False)
+    monkeypatch.delenv('NS_AUTOLOGIN', raising=False)
+    monkeypatch.delenv('NS_PIN', raising=False)
+    monkeypatch.setattr(live, 'get_secret', lambda key, **kwargs: secrets[key])
+    monkeypatch.setattr(
+        live,
+        'set_secret',
+        lambda key, value, *, backend, reason: saved.append(
+            (key, value, backend, reason)
+        ),
+    )
+
+    class FakeResponse:
+        def __init__(
+            self,
+            status_code: int,
+            text: str,
+            headers: dict[str, str] | None = None,
+        ) -> None:
+            self.status_code = status_code
+            self.ok = status_code == 200
+            self.text = text
+            self.headers = headers or {}
+
+    responses = iter([
+        FakeResponse(403, '<ERROR>Invalid PIN</ERROR>'),
+        FakeResponse(
+            200,
+            '<NATION><ISSUES /></NATION>',
+            {'X-Pin': 'fresh-pin'},
+        ),
+    ])
+    client = NationStatesClient.from_env(config)
+    monkeypatch.setattr(
+        client.session,
+        'get',
+        lambda url, *, params, headers, timeout: next(responses),
+    )
+
+    client.issues('Oringrad')
+
+    assert client.pin == 'fresh-pin'
+    assert saved == [(
+        pin_key,
+        'fresh-pin',
+        'keyring',
+        'Refresh NationStates PIN for Oringrad',
+    )]
+
+
 def test_establish_session_captures_pin_and_autologin(monkeypatch) -> None:
     client = NationStatesClient(
         user_agent='NSAI-Test/0.1 contact:test@example.com nation:Oringrad',

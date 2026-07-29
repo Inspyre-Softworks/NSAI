@@ -29,6 +29,7 @@ from nsai.advisor.audit import (
     load_audit_log_records,
     migrate_jsonl_audit_log,
     pending_publication_entries,
+    resolve_audit_store_path,
     write_audit_log,
 )
 from nsai.advisor.cache import AdviceCache, CachedAdvice, live_issue_by_id
@@ -1246,7 +1247,11 @@ def run_advise(args: argparse.Namespace) -> None:
         args.no_ai,
         nation_config.no_ai if nation_config else None,
     )
-    audit_log = args.audit_log or (nation_config.audit_log if nation_config else None) or DEFAULT_AUDIT_LOG
+    audit_log = str(resolve_audit_store_path(Path(
+        args.audit_log
+        or (nation_config.audit_log if nation_config else None)
+        or DEFAULT_AUDIT_LOG
+    )))
     lm_base_url, lm_model, lm_api_key = resolve_lm_settings(args, nation_config)
 
     draft_dispatch = resolve_draft_request(

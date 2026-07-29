@@ -165,6 +165,8 @@ class GovernanceProfileApp(App):
         self.index = 0
         self.answers: dict[str, Any] = {}
         self.enrich_on_save = enrich_on_save
+        self.saving = False
+        self.saved_path: Path | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -243,9 +245,21 @@ class GovernanceProfileApp(App):
             preview.update(self.build_preview_text())
             self.set_focus(self.query_one('#save', Button))
 
-        self.query_one('#back', Button).disabled = self.index == 0
-        self.query_one('#next', Button).disabled = self.index == len(STEPS) - 1
-        self.query_one('#save', Button).disabled = step.kind != 'review'
+        back_button = self.query_one('#back', Button)
+        next_button = self.query_one('#next', Button)
+        save_button = self.query_one('#save', Button)
+
+        back_button.disabled = self.index == 0 or self.saving
+        next_button.label = 'Finish →' if step.kind == 'review' and self.saved_path else 'Next →'
+        next_button.disabled = (
+            self.saving
+            or (step.kind == 'review' and self.saved_path is None)
+        )
+        save_button.disabled = (
+            step.kind != 'review'
+            or self.saving
+            or self.saved_path is not None
+        )
 
     def set_text_area_text(self, text_area: TextArea, text: str) -> None:
         if hasattr(text_area, 'load_text'):
@@ -313,6 +327,7 @@ class GovernanceProfileApp(App):
             return False
 
         self.answers[step.key] = parsed
+        self.saved_path = None
         self.query_one('#validation', Static).update('')
         return True
 
@@ -495,7 +510,16 @@ class GovernanceProfileApp(App):
     def save_pressed(self, event: Button.Pressed) -> None:
         self.action_save()
 
+    @on(Input.Submitted, '#answer_input')
+    def answer_submitted(self, event: Input.Submitted) -> None:
+        self.action_next_step()
+
     def action_next_step(self) -> None:
+        if self.current_step().kind == 'review':
+            if self.saved_path is not None:
+                self.exit(self.saved_path)
+            return
+
         if not self.save_current_answer():
             return
 
@@ -512,9 +536,17 @@ class GovernanceProfileApp(App):
             self.load_step()
 
     def action_save(self) -> None:
+        if self.saving or self.saved_path is not None:
+            return
+
         if self.current_step().kind != 'review':
             if not self.save_current_answer():
                 return
+
+        self.saving = True
+        self.query_one('#back', Button).disabled = True
+        self.query_one('#next', Button).disabled = True
+        self.query_one('#save', Button).disabled = True
 
         if self.enrich_on_save:
             self.query_one('#validation', Static).update(
@@ -525,12 +557,30 @@ class GovernanceProfileApp(App):
                 '⏳ Saving governance profile...'
             )
 
+        self.call_after_refresh(self._perform_save)
+
+    def _perform_save(self) -> None:
         try:
             path = self.save_profile()
         except Exception as exc:
+            self.saving = False
+            self.query_one('#back', Button).disabled = self.index == 0
+            self.query_one('#save', Button).disabled = (
+                self.current_step().kind != 'review'
+            )
             self.query_one('#validation', Static).update(f'❌ Save failed: {exc}')
             return
 
+        self.saving = False
+        self.saved_path = path
+        self.query_one('#back', Button).disabled = False
+        next_button = self.query_one('#next', Button)
+        next_button.label = (
+            'Finish →'
+            if self.current_step().kind == 'review'
+            else 'Next →'
+        )
+        next_button.disabled = False
         self.query_one('#validation', Static).update(
             f'✅ Saved governance profile to {path}'
         )
@@ -807,6 +857,7 @@ def print_profile_preview(
     )
     priorities.add_column('Area', style='bold')
     priorities.add_column('Values')
+    priorities.add_row('Concerns', format_preview_list(profile_data.get('concerns')))
     priorities.add_row('Top Priorities', format_preview_list(profile_data.get('top_priorities')))
     priorities.add_row(
         'Secondary Priorities',

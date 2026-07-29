@@ -182,4 +182,5 @@ cython_debug/
 .idea/
 *.lock
 *.jsonl
+ns_governor_audit.sqlite3*
 dist/

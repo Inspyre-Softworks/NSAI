@@ -18,6 +18,7 @@ from nsai.advisor.cached_advice import add_advice_arguments
 from nsai.nations import add_nation_arguments
 from nsai.world_dataset import add_world_arguments
 from nsai.profile.auto import add_auto_profile_arguments, run_auto
+from nsai.profile.concerns import add_concern_arguments
 from nsai.profile.builder import (
     add_enrich_ai_arguments,
     add_textual_dev_argument,
@@ -117,6 +118,8 @@ def build_parser() -> argparse.ArgumentParser:
     add_auto_profile_arguments(auto_parser)
     auto_parser.set_defaults(func=run_auto)
 
+    add_concern_arguments(profile_subparsers)
+
     advise_parser = subparsers.add_parser(
         'advise',
         help='Recommend, audit, and optionally enact a live NationStates issue choice.',
@@ -164,6 +167,24 @@ def _run(argv: list[str] | None = None) -> None:
             if isinstance(action, argparse._SubParsersAction)
         ).choices['profile']
         profile_parser.print_help()
+        return
+
+    if (
+        args.command == 'profile'
+        and args.profile_command == 'concern'
+        and args.concern_command is None
+    ):
+        profile_parser = next(
+            action
+            for action in parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        ).choices['profile']
+        concern_parser = next(
+            action
+            for action in profile_parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        ).choices['concern']
+        concern_parser.print_help()
         return
 
     if args.command == 'nation' and args.nation_command is None:

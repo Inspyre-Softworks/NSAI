@@ -6,6 +6,7 @@ import argparse
 import copy
 import os
 import re
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -21,12 +22,13 @@ from textual.containers import Container, Horizontal, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, Collapsible, Footer, Header, Label, Static
 
-from nsai.advisor.cache import AdviceCache, CachedAdvice
+from nsai.advisor.cache import AdviceCache, CachedAdvice, extract_enactment_outcome
 from nsai.nations import saved_default_nation_config
 
 
 OPTION_REFERENCE_PATTERN = re.compile(r'\bOption\s+(-?\d+)\b', re.IGNORECASE)
 WEBSITE_OPTION_LABEL_BASIS = 'website_position'
+ENACT_ALL_ACTION = '__enact_all__'
 
 
 def relief_table() -> Table:
@@ -160,6 +162,155 @@ def _metadata_text(cached: CachedAdvice) -> Text:
     return text
 
 
+def enactment_outcome_table(cached: CachedAdvice) -> Table:
+    """Render the terminal state of an answered issue from its cached API result."""
+
+    choice, choice_style, _ = website_option_label(cached)
+    effects = cached.last_effects
+    headlines = cached.last_headlines
+    if cached.last_result_xml:
+        parsed_effects, parsed_headlines = extract_enactment_outcome(
+            cached.last_result_xml
+        )
+        effects = parsed_effects or effects
+        headlines = parsed_headlines or headlines
+
+    details = relief_table()
+    details.add_row('Status', Text('Answered successfully', style='bold green'))
+    details.add_row('Choice', Text(choice, style=choice_style))
+    details.add_row('History', f'Applied by NSAI {cached.enacted_count} time(s)')
+
+    rankings = [effect for effect in effects if effect.get('tag') == 'rank']
+    if rankings:
+        stats = Table(
+            box=box.SIMPLE,
+            show_header=True,
+            expand=True,
+            padding=(0, 1),
+        )
+        stats.add_column('Stat', style='bold cyan', no_wrap=True)
+        stats.add_column('Score', justify='right')
+        stats.add_column('Change', justify='right')
+        stats.add_column('% change', justify='right')
+        for effect in rankings:
+            attributes = effect.get('attributes') or {}
+            values = effect.get('values') or {}
+            stats.add_row(
+                str(attributes.get('id') or '?'),
+                str(values.get('score') or effect.get('text') or '—'),
+                str(values.get('change') or '—'),
+                str(values.get('pchange') or '—'),
+            )
+        details.add_row('Stats', stats)
+    elif effects:
+        outcome_lines = []
+        for effect in effects:
+            tag = str(effect.get('tag') or 'effect').replace('_', ' ').title()
+            attributes = effect.get('attributes') or {}
+            identifier = attributes.get('id')
+            label = f'{tag} {identifier}' if identifier is not None else tag
+            outcome_lines.append(f'{label}: {effect.get("text") or "—"}')
+        details.add_row('Stats', '\n'.join(outcome_lines))
+
+    if headlines:
+        details.add_row('Headlines', '\n'.join(f'• {headline}' for headline in headlines))
+
+    if not effects and not headlines:
+        details.add_row('Outcome data', 'NationStates returned no rankings or headlines.')
+
+    return details
+
+
+def _decimal_change_text(value: Decimal, *, suffix: str = '') -> str:
+    rounded = value.quantize(Decimal('0.000001'))
+    rendered = format(rounded, 'f').rstrip('0').rstrip('.') or '0'
+    if value > 0:
+        rendered = f'+{rendered}'
+    return f'{rendered}{suffix}'
+
+
+def cumulative_enactment_effects_table(
+    enactments: list[CachedAdvice],
+) -> Table:
+    """Combine ranking changes across recently enacted issue outcomes."""
+
+    totals: dict[str, dict[str, Any]] = {}
+    for cached in enactments:
+        effects = cached.last_effects
+        if cached.last_result_xml:
+            parsed_effects, _ = extract_enactment_outcome(cached.last_result_xml)
+            effects = parsed_effects or effects
+
+        for effect in effects:
+            if effect.get('tag') != 'rank':
+                continue
+            attributes = effect.get('attributes') or {}
+            values = effect.get('values') or {}
+            stat_id = str(attributes.get('id') or '?')
+            total = totals.setdefault(stat_id, {
+                'latest_score': '—',
+                'change': Decimal('0'),
+                'percentage_factor': Decimal('1'),
+                'affected_issues': 0,
+            })
+            if values.get('score') not in (None, ''):
+                total['latest_score'] = str(values['score'])
+            try:
+                total['change'] += Decimal(str(values.get('change') or '0'))
+            except InvalidOperation:
+                pass
+            try:
+                percentage = Decimal(str(values.get('pchange') or '0'))
+                total['percentage_factor'] *= Decimal('1') + (
+                    percentage / Decimal('100')
+                )
+            except InvalidOperation:
+                pass
+            total['affected_issues'] += 1
+
+    details = relief_table()
+    details.add_row(
+        'Scope',
+        f'{len(enactments)} successfully enacted issue(s) from this TUI session',
+    )
+    if not totals:
+        details.add_row(
+            'Stats',
+            'NationStates returned no ranking changes for these enactments.',
+        )
+        return details
+
+    stats = Table(
+        box=box.SIMPLE,
+        show_header=True,
+        expand=True,
+        padding=(0, 1),
+    )
+    stats.add_column('Stat', style='bold cyan', no_wrap=True)
+    stats.add_column('Latest score', justify='right')
+    stats.add_column('Total change', justify='right')
+    stats.add_column('Combined % change', justify='right')
+    stats.add_column('Affected issues', justify='right')
+
+    def stat_sort_key(stat_id: str) -> tuple[int, int | str]:
+        return (0, int(stat_id)) if stat_id.isdigit() else (1, stat_id)
+
+    for stat_id in sorted(totals, key=stat_sort_key):
+        total = totals[stat_id]
+        combined_percentage = (
+            total['percentage_factor'] - Decimal('1')
+        ) * Decimal('100')
+        stats.add_row(
+            stat_id,
+            str(total['latest_score']),
+            _decimal_change_text(total['change']),
+            _decimal_change_text(combined_percentage, suffix='%'),
+            str(total['affected_issues']),
+        )
+    details.add_row('Stats', stats)
+    return details
+
+
 def render_cached_advice_report(
     nation: str,
     *,
@@ -203,17 +354,15 @@ def render_cached_advice_report(
         title = str(cached.live_issue.get('title') or 'Untitled issue')
         choice, choice_style, option_text = website_option_label(cached)
 
-        details = relief_table()
-        details.add_row('Choice', Text(choice, style=choice_style))
-        if option_text:
-            details.add_row('Option text', option_text)
-        details.add_row('Rationale', display_reason(cached))
-        details.add_row('Details', _metadata_text(cached))
         if cached.enacted_count:
-            details.add_row(
-                'History',
-                f'Applied by NSAI {cached.enacted_count} time(s)',
-            )
+            details = enactment_outcome_table(cached)
+        else:
+            details = relief_table()
+            details.add_row('Choice', Text(choice, style=choice_style))
+            if option_text:
+                details.add_row('Option text', option_text)
+            details.add_row('Rationale', display_reason(cached))
+            details.add_row('Details', _metadata_text(cached))
 
         console.print(
             Panel(
@@ -265,32 +414,145 @@ class ConfirmAdviceActionScreen(ModalScreen[bool]):
     }
     """
 
-    def __init__(self, *, issue_title: str, choice: str) -> None:
+    def __init__(
+        self,
+        *,
+        issue_title: str,
+        choice: str,
+        bulk_count: int | None = None,
+    ) -> None:
         super().__init__()
         self.issue_title = issue_title
         self.choice = choice
+        self.bulk_count = bulk_count
 
     def compose(self) -> ComposeResult:
-        verb = 'dismiss this issue' if self.choice == 'dismissed' else f'enact {self.choice}'
-        with Container(id='confirm-dialog'):
-            yield Label(f'Confirm {verb}?', id='confirm-title')
-            yield Label(
+        if self.bulk_count is not None:
+            verb = f'enact all {self.bulk_count} remaining recommendations'
+            detail = (
+                f'{self.issue_title}\n\nNSAI will process each issue separately in '
+                'the current plan order. Every recommendation will be re-checked '
+                'against the live issue and will run through the normal validation, '
+                'safety, cooldown, audit, and publication path. Dismissal '
+                'recommendations will dismiss their issue. Guardrail failures will '
+                'remain advisor-only.'
+            )
+            confirm_label = 'Confirm enact all'
+            confirm_variant = 'warning'
+        else:
+            verb = (
+                'dismiss this issue'
+                if self.choice == 'dismissed'
+                else f'enact {self.choice}'
+            )
+            detail = (
                 f'{self.issue_title}\n\nNSAI will re-check the live issue and run the '
                 'normal validation, safety, audit, and publication path. A request '
-                'that fails guardrails will remain advisor-only.',
-                id='confirm-detail',
+                'that fails guardrails will remain advisor-only.'
             )
+            confirm_label = (
+                'Confirm dismissal'
+                if self.choice == 'dismissed'
+                else 'Confirm enactment'
+            )
+            confirm_variant = 'warning' if self.choice == 'dismissed' else 'success'
+
+        with Container(id='confirm-dialog'):
+            yield Label(f'Confirm {verb}?', id='confirm-title')
+            yield Label(detail, id='confirm-detail')
             with Horizontal(id='confirm-buttons'):
                 yield Button('Cancel', id='cancel-action')
                 yield Button(
-                    'Confirm dismissal' if self.choice == 'dismissed' else 'Confirm enactment',
+                    confirm_label,
                     id='confirm-action',
-                    variant='warning' if self.choice == 'dismissed' else 'success',
+                    variant=confirm_variant,
                 )
 
     @on(Button.Pressed)
     def handle_button(self, event: Button.Pressed) -> None:
         self.dismiss(event.button.id == 'confirm-action')
+
+
+class RecentEnactmentEffectsScreen(ModalScreen[None]):
+    """Show the combined outcomes enacted during the current TUI session."""
+
+    BINDINGS = [
+        Binding('escape', 'close_effects', 'Back', priority=True),
+    ]
+
+    CSS = """
+    RecentEnactmentEffectsScreen {
+        align: center middle;
+        background: rgba(3, 7, 18, 0.88);
+    }
+
+    #recent-effects-dialog {
+        width: 94%;
+        height: 92%;
+        padding: 1 2;
+        background: #090f1f;
+        border: heavy #36c98f;
+    }
+
+    #recent-effects-title {
+        height: auto;
+        margin-bottom: 1;
+        text-style: bold;
+        color: #f4f7fb;
+    }
+
+    #recent-effects-list {
+        height: 1fr;
+    }
+
+    .recent-effect, .cumulative-effect {
+        height: auto;
+        margin-bottom: 1;
+    }
+
+    #recent-effects-hint {
+        height: auto;
+        margin-top: 1;
+        color: #94a3b8;
+    }
+    """
+
+    def __init__(self, enactments: list[CachedAdvice]) -> None:
+        super().__init__()
+        self.enactments = enactments
+
+    def compose(self) -> ComposeResult:
+        with Container(id='recent-effects-dialog'):
+            yield Label(
+                f'Recent Enactment Effects · {len(self.enactments)} issue(s)',
+                id='recent-effects-title',
+            )
+            with VerticalScroll(id='recent-effects-list'):
+                yield Static(
+                    Panel(
+                        cumulative_enactment_effects_table(self.enactments),
+                        title='Cumulative Effects',
+                        border_style='bold cyan',
+                    ),
+                    classes='cumulative-effect',
+                )
+                for cached in self.enactments:
+                    title = str(
+                        cached.live_issue.get('title')
+                        or f'Issue {cached.issue_id}'
+                    )
+                    yield Static(
+                        Panel(
+                            enactment_outcome_table(cached),
+                            title=f'{title} · Issue {cached.issue_id}',
+                            border_style='green',
+                        ),
+                        classes='recent-effect',
+                    )
+            yield Label('Press Tab or Escape to return.', id='recent-effects-hint')
+
+    def action_close_effects(self) -> None:
+        self.dismiss(None)
 
 
 class CachedAdviceApp(App[str | None]):
@@ -300,6 +562,7 @@ class CachedAdviceApp(App[str | None]):
     SUB_TITLE = 'Read-only cached snapshot'
     BINDINGS = [
         ('q', 'quit', 'Quit'),
+        Binding('tab', 'show_recent_effects', 'Recent effects', priority=True),
         ('e', 'expand_all', 'Expand all'),
         ('c', 'collapse_all', 'Collapse all'),
         *[
@@ -330,6 +593,17 @@ class CachedAdviceApp(App[str | None]):
         padding: 0 2 1 2;
     }
 
+    #bulk-actions {
+        height: auto;
+        padding: 0 2 1 2;
+        align-horizontal: right;
+    }
+
+    #enact-all {
+        width: auto;
+        min-width: 28;
+    }
+
     Collapsible {
         margin-bottom: 1;
         padding: 0 1;
@@ -343,6 +617,10 @@ class CachedAdviceApp(App[str | None]):
 
     Collapsible.dismissed {
         border: round #c05acb;
+    }
+
+    Collapsible.answered {
+        border: heavy #36c98f;
     }
 
     Collapsible.missing {
@@ -367,28 +645,76 @@ class CachedAdviceApp(App[str | None]):
         cache: AdviceCache | None = None,
         *,
         allow_actions: bool = False,
+        outcome_issue_ids: list[str] | None = None,
     ) -> None:
         super().__init__()
         self.nation = nation
         self.cache = cache or AdviceCache()
         self.allow_actions = allow_actions
+        self.outcome_issue_ids = [str(issue_id) for issue_id in outcome_issue_ids or []]
         self.plan = self.cache.get_latest_issue_plan(nation)
         self.issue_ids = self._ordered_issue_ids()
 
     def _ordered_issue_ids(self) -> list[str]:
-        if self.plan is None:
-            return []
-        active_ids = {str(issue_id) for issue_id in self.plan.issue_ids}
-        ordered_ids = [str(issue_id) for issue_id in self.plan.ordered_issue_ids]
+        active_ids = (
+            {str(issue_id) for issue_id in self.plan.issue_ids}
+            if self.plan is not None
+            else set()
+        )
+        ordered_ids = (
+            [str(issue_id) for issue_id in self.plan.ordered_issue_ids]
+            if self.plan is not None
+            else []
+        )
+        outcome_ids = list(dict.fromkeys(self.outcome_issue_ids))
+        outcome_set = set(outcome_ids)
         return [
-            *[issue_id for issue_id in ordered_ids if issue_id in active_ids],
-            *sorted(active_ids - set(ordered_ids)),
+            *outcome_ids,
+            *[
+                issue_id
+                for issue_id in ordered_ids
+                if issue_id in active_ids and issue_id not in outcome_set
+            ],
+            *sorted(active_ids - set(ordered_ids) - outcome_set),
         ]
+
+    def actionable_issue_ids(self) -> list[str]:
+        outcome_set = set(self.outcome_issue_ids)
+        actionable: list[str] = []
+        for issue_id in self.issue_ids:
+            if issue_id in outcome_set:
+                continue
+            cached = self.cache.get_advice(self.nation, issue_id)
+            if cached is None or cached.enacted_count:
+                continue
+            choice, _, _ = website_option_label(cached)
+            if not choice.startswith('unknown option ID'):
+                actionable.append(issue_id)
+        return actionable
+
+    def _default_expanded_issue_id(self) -> str | None:
+        outcome_set = set(self.outcome_issue_ids)
+        return next(
+            (
+                issue_id
+                for issue_id in self.issue_ids
+                if issue_id not in outcome_set
+            ),
+            self.issue_ids[0] if self.issue_ids else None,
+        )
+
+    def recent_enactments(self) -> list[CachedAdvice]:
+        enactments: list[CachedAdvice] = []
+        for issue_id in self.outcome_issue_ids:
+            cached = self.cache.get_advice(self.nation, issue_id)
+            if cached is not None and cached.enacted_count:
+                enactments.append(cached)
+        return enactments
 
     def compose(self) -> ComposeResult:
         yield Header()
 
-        if self.plan is None:
+        if self.plan is None and not self.issue_ids:
             yield Static(
                 Text(f'No cached active-issue plan found for {self.nation}.', style='yellow'),
                 id='summary',
@@ -398,12 +724,19 @@ class CachedAdviceApp(App[str | None]):
 
         summary = relief_table()
         summary.add_row('Nation', self.nation)
-        summary.add_row('Advisor snapshot', self.plan.updated_at)
-        summary.add_row('Active issues', str(len(self.issue_ids)))
+        summary.add_row(
+            'Advisor snapshot',
+            self.plan.updated_at if self.plan is not None else 'No live issues remain',
+        )
+        active_count = len(self.plan.issue_ids) if self.plan is not None else 0
+        summary.add_row('Active issues', str(active_count))
+        if self.outcome_issue_ids:
+            summary.add_row('Answered this session', str(len(self.outcome_issue_ids)))
         summary.add_row('Cache', str(self.cache.path))
         summary.add_row('Shortcuts', '1–9 toggle cards  •  e expand all  •  c collapse all  •  q quit')
         yield Static(summary, id='summary')
 
+        default_expanded_issue_id = self._default_expanded_issue_id()
         with VerticalScroll(id='issues'):
             for index, issue_id in enumerate(self.issue_ids):
                 cached = self.cache.get_advice(self.nation, issue_id)
@@ -414,7 +747,7 @@ class CachedAdviceApp(App[str | None]):
                             classes='issue-details',
                         ),
                         title=f'Issue {issue_id}  ·  no cached recommendation',
-                        collapsed=index != 0,
+                        collapsed=issue_id != default_expanded_issue_id,
                         classes='missing',
                     ):
                         pass
@@ -422,23 +755,25 @@ class CachedAdviceApp(App[str | None]):
 
                 title = str(cached.live_issue.get('title') or 'Untitled issue')
                 choice, choice_style, option_text = website_option_label(cached)
-                details = relief_table()
-                details.add_row('Choice', Text(choice, style=choice_style))
-                if option_text:
-                    details.add_row('Option text', option_text)
-                details.add_row('Rationale', display_reason(cached))
-                details.add_row('Details', _metadata_text(cached))
                 if cached.enacted_count:
-                    details.add_row(
-                        'History',
-                        f'Applied by NSAI {cached.enacted_count} time(s)',
-                    )
+                    details = enactment_outcome_table(cached)
+                else:
+                    details = relief_table()
+                    details.add_row('Choice', Text(choice, style=choice_style))
+                    if option_text:
+                        details.add_row('Option text', option_text)
+                    details.add_row('Rationale', display_reason(cached))
+                    details.add_row('Details', _metadata_text(cached))
 
-                classes = 'dismissed' if choice == 'dismissed' else ''
+                classes = (
+                    'answered'
+                    if cached.enacted_count
+                    else ('dismissed' if choice == 'dismissed' else '')
+                )
                 children: list[Static | Button] = [
                     Static(details, classes='issue-details')
                 ]
-                if self.allow_actions:
+                if self.allow_actions and not cached.enacted_count:
                     action_label = (
                         'Dismiss issue'
                         if choice == 'dismissed'
@@ -456,11 +791,24 @@ class CachedAdviceApp(App[str | None]):
 
                 with Collapsible(
                     *children,
-                    title=f'{choice}  ·  {title}  ·  Issue {issue_id}',
-                    collapsed=index != 0,
+                    title=(
+                        f'Answered  ·  {choice}  ·  {title}  ·  Issue {issue_id}'
+                        if cached.enacted_count
+                        else f'{choice}  ·  {title}  ·  Issue {issue_id}'
+                    ),
+                    collapsed=issue_id != default_expanded_issue_id,
                     classes=classes,
                 ):
                     pass
+
+        actionable_count = len(self.actionable_issue_ids())
+        if self.allow_actions and actionable_count:
+            with Horizontal(id='bulk-actions'):
+                yield Button(
+                    f'Enact all recommendations ({actionable_count})',
+                    id='enact-all',
+                    variant='warning',
+                )
 
         yield Footer()
 
@@ -476,6 +824,20 @@ class CachedAdviceApp(App[str | None]):
         cards = list(self.query(Collapsible))
         if 0 <= index < len(cards):
             cards[index].collapsed = not cards[index].collapsed
+
+    def action_show_recent_effects(self) -> None:
+        if isinstance(self.screen, RecentEnactmentEffectsScreen):
+            self.screen.dismiss(None)
+            return
+
+        enactments = self.recent_enactments()
+        if not enactments:
+            self.notify(
+                'No issues have been enacted during this TUI session.',
+                severity='information',
+            )
+            return
+        self.push_screen(RecentEnactmentEffectsScreen(enactments))
 
     @on(Button.Pressed, '.issue-action')
     def request_issue_action(self, event: Button.Pressed) -> None:
@@ -502,6 +864,26 @@ class CachedAdviceApp(App[str | None]):
 
         self.push_screen(
             ConfirmAdviceActionScreen(issue_title=issue_title, choice=choice),
+            finish_request,
+        )
+
+    @on(Button.Pressed, '#enact-all')
+    def request_all_actions(self) -> None:
+        issue_ids = self.actionable_issue_ids()
+        if not issue_ids:
+            self.notify('No unanswered recommendations remain.', severity='warning')
+            return
+
+        def finish_request(confirmed: bool | None) -> None:
+            if confirmed:
+                self.exit(ENACT_ALL_ACTION)
+
+        self.push_screen(
+            ConfirmAdviceActionScreen(
+                issue_title='All currently unanswered issues',
+                choice='all',
+                bulk_count=len(issue_ids),
+            ),
             finish_request,
         )
 
@@ -552,27 +934,78 @@ def run_advisor_tui(args: argparse.Namespace) -> None:
 
     run_advise(advising_args)
     advising_args.refresh_advice = False
+    outcome_issue_ids: list[str] = []
 
     while True:
         with textual_devtools_enabled(bool(getattr(args, 'dev', False))):
-            issue_id = CachedAdviceApp(nation, allow_actions=True).run()
+            viewer = CachedAdviceApp(
+                nation,
+                allow_actions=True,
+                outcome_issue_ids=outcome_issue_ids,
+            )
+            selection = viewer.run()
 
-        if not issue_id:
+        if not selection:
             return
 
-        action_args = copy.copy(args)
-        action_args.tui = False
-        action_args._tui_child = True
-        action_args.all_issues = False
-        action_args.enact = True
-        action_args.auto = False
-        action_args.refresh_advice = False
-        action_args._target_issue_id = issue_id
-        action_args._target_issue_reason = 'Selected interactively in the advice TUI.'
-        action_args._target_issue_source = 'advice_tui'
-        action_args._target_issue_order_fallback = False
+        issue_ids = (
+            viewer.actionable_issue_ids()
+            if selection == ENACT_ALL_ACTION
+            else [selection]
+        )
+        shared_issue_state = {'last_action_at': None}
+        shared_publication_state = {'cooldown_hit': False, 'last_post_at': None}
+        viewer_cache = getattr(viewer, 'cache', None)
+        for index, issue_id in enumerate(issue_ids):
+            cached_before = (
+                viewer_cache.get_advice(nation, issue_id)
+                if viewer_cache is not None
+                else None
+            )
+            enacted_before = (
+                cached_before.enacted_count
+                if cached_before is not None
+                else None
+            )
+            action_args = copy.copy(args)
+            action_args.tui = False
+            action_args._tui_child = True
+            action_args.all_issues = False
+            action_args.enact = True
+            action_args.auto = False
+            action_args.refresh_advice = False
+            action_args._target_issue_id = issue_id
+            action_args._target_issue_reason = (
+                'Selected by Enact all in the advice TUI.'
+                if selection == ENACT_ALL_ACTION
+                else 'Selected interactively in the advice TUI.'
+            )
+            action_args._target_issue_source = (
+                'advice_tui_enact_all'
+                if selection == ENACT_ALL_ACTION
+                else 'advice_tui'
+            )
+            action_args._target_issue_order_fallback = False
+            action_args._issue_state = shared_issue_state
+            action_args._publication_state = shared_publication_state
+            action_args._issue_cooldown_required = index > 0
 
-        run_advise(action_args)
+            run_advise(action_args)
+            cached_after = (
+                viewer_cache.get_advice(nation, issue_id)
+                if viewer_cache is not None
+                else None
+            )
+            action_succeeded = (
+                viewer_cache is None
+                or (
+                    cached_after is not None
+                    and enacted_before is not None
+                    and cached_after.enacted_count > enacted_before
+                )
+            )
+            if action_succeeded and issue_id not in outcome_issue_ids:
+                outcome_issue_ids.append(issue_id)
 
         # Refresh the live issue set after every request. If guardrails blocked the
         # action, the issue remains; if NationStates accepted it, the card disappears.
@@ -581,8 +1014,8 @@ def run_advisor_tui(args: argparse.Namespace) -> None:
         except SystemExit as exc:
             if 'No live issues found' in str(exc):
                 print('No live issues remain for this nation.')
-                return
-            raise
+            else:
+                raise
 
 
 def add_advice_arguments(subparsers: argparse._SubParsersAction) -> None:
@@ -614,10 +1047,14 @@ def add_advice_arguments(subparsers: argparse._SubParsersAction) -> None:
 
 
 __all__ = [
+    'ENACT_ALL_ACTION',
     'WEBSITE_OPTION_LABEL_BASIS',
     'CachedAdviceApp',
+    'RecentEnactmentEffectsScreen',
     'add_advice_arguments',
+    'cumulative_enactment_effects_table',
     'display_reason',
+    'enactment_outcome_table',
     'option_number_by_id',
     'relief_table',
     'render_cached_advice_report',

@@ -53,6 +53,7 @@ class CachedAdvice:
     enacted_count: int
     last_effects: list[dict[str, Any]]
     last_headlines: list[str]
+    last_result_xml: str | None
     updated_at: str
 
 
@@ -117,10 +118,16 @@ def extract_enactment_outcome(result_xml: str) -> tuple[list[dict[str, Any]], li
             headlines.append(text)
 
         if tag in effect_tags:
+            values = {
+                local_tag(child.tag).lower(): clean_text(''.join(child.itertext()))
+                for child in element
+                if clean_text(''.join(child.itertext()))
+            }
             effects.append({
                 'tag': tag.lower(),
                 'attributes': dict(element.attrib),
                 'text': text,
+                'values': values,
             })
 
     return effects, headlines
@@ -492,6 +499,7 @@ class AdviceCache:
             enacted_count=int(row['enacted_count'] or 0),
             last_effects=json.loads(str(row['last_effects_json'] or '[]')),
             last_headlines=json.loads(str(row['last_headlines_json'] or '[]')),
+            last_result_xml=row['last_result_xml'],
             updated_at=str(row['updated_at']),
         )
 

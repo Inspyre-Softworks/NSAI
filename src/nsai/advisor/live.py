@@ -109,6 +109,7 @@ from nsai.advisor.audit import (  # noqa: F401
     pending_publication_entries,
     posted_publication_keys,
     publication_source_key,
+    resolve_audit_store_path,
     write_audit_log,
 )
 from nsai.advisor.cli import (  # noqa: F401
@@ -877,7 +878,8 @@ def prefetch_issue_advice(
     console.print(
         f'Prefetching missing advice: {len(issues_to_prefetch)}/'
         f'{len(ordered_issue_ids)} issue(s), {worker_count} worker(s), '
-        f'{len(cached_issue_ids)} cached, requested {parallel_requests}.',
+        f'{len(cached_issue_ids)} cached. Worker limit: {parallel_requests}. '
+        'Next task starts when a worker is free.',
         highlight=False,
     )
 
@@ -1233,7 +1235,11 @@ def run_advise(args: argparse.Namespace) -> None:
         args.no_ai,
         nation_config.no_ai if nation_config else None,
     )
-    audit_log = args.audit_log or (nation_config.audit_log if nation_config else None) or DEFAULT_AUDIT_LOG
+    audit_log = str(resolve_audit_store_path(Path(
+        args.audit_log
+        or (nation_config.audit_log if nation_config else None)
+        or DEFAULT_AUDIT_LOG
+    )))
     seed_cooldown_state_from_audit(
         publication_state=publication_state,
         issue_state=issue_state,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from datetime import datetime, timezone
 from io import BytesIO
@@ -12,7 +13,7 @@ from PIL import Image
 from rich.console import Console
 
 import nsai.advisor.live as live
-from nsai.advisor.audit import AuditStore, load_audit_log_records, migrate_jsonl_audit_log, write_audit_log
+from nsai.advisor.audit import AuditStore, load_audit_log_records, migrate_jsonl_audit_log, resolve_audit_store_path, write_audit_log
 from nsai.advisor.live import (
     NationStatesError,
     NationStatesClient,
@@ -2070,7 +2071,84 @@ def test_all_issues_parallel_prefetch_reports_cached_advice(
     assert FakeGovernor.advise_issue_ids == ['456']
     assert FakeGovernor.advise_pulse_labels == [None]
     assert 'Prefetching missing advice: 1/2 issue(s), 1 worker(s)' in output
-    assert '1 cached, requested 2' in output
+    normalized_output = ' '.join(output.split())
+    assert 'Worker limit: 2' in normalized_output
+    assert 'Next task starts when a worker is free.' in normalized_output
+
+
+def test_parallel_prefetch_refills_worker_as_soon_as_one_finishes(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv('NSAI_CONFIG_HOME', str(tmp_path / 'config-home'))
+    first_started = threading.Event()
+    first_finished = threading.Event()
+    release_first = threading.Event()
+    third_started_before_first_finished: list[bool] = []
+    issues = [
+        {
+            'issue_id': issue_id,
+            'title': f'Issue {issue_id}',
+            'text': f'Policy question {issue_id}.',
+            'options': [{'option_id': '2', 'text': 'Adopt it.'}],
+        }
+        for issue_id in ('1', '2', '3')
+    ]
+
+    class FakeGovernor:
+        def __init__(self, *, base_url=None, model=None, api_key=None, **kwargs):
+            self.base_url = base_url or 'http://localhost:1234/v1'
+            self.model = model or 'test-model'
+
+        def advise(self, *, live_issues, **kwargs):
+            issue_id = str(live_issues[0]['issue_id'])
+            if issue_id == '1':
+                first_started.set()
+                assert release_first.wait(timeout=5)
+                first_finished.set()
+            elif issue_id == '2':
+                assert first_started.wait(timeout=5)
+            elif issue_id == '3':
+                third_started_before_first_finished.append(
+                    not first_finished.is_set()
+                )
+                release_first.set()
+
+            return {
+                **sample_recommendation(),
+                'issue_id': issue_id,
+                'option_id': '2',
+                'headline': f'Handle issue {issue_id}',
+                'model': self.model,
+            }
+
+    monkeypatch.setattr(live, 'LocalGovernor', FakeGovernor)
+    args = advise_args(tmp_path, profile_path=write_auto_profile(tmp_path))
+    args.refresh_advice = False
+    args.parallel_requests = 2
+    cache = live.AdviceCache()
+
+    live.prefetch_issue_advice(
+        args=args,
+        nation='Oringrad',
+        ordered_issue_ids=['1', '2', '3'],
+        live_issues=issues,
+        cache=cache,
+        strategy='keep things stable',
+        profile=None,
+        nation_snapshot_xml='<NATION />',
+        lm_base_url='http://localhost:1234/v1',
+        lm_model='test-model',
+        lm_api_key='not-needed',
+        draft_dispatch=False,
+        draft_factbook=False,
+        valid_options=collect_issue_option_ids(issues),
+        console=Console(record=True, color_system=None),
+    )
+
+    assert third_started_before_first_finished == [True]
+    assert first_finished.is_set()
+    assert all(cache.get_advice('Oringrad', issue_id) for issue_id in ('1', '2', '3'))
 
 
 def test_all_issues_progress_uses_stable_timer_layout() -> None:
@@ -3391,6 +3469,37 @@ def test_migrate_jsonl_audit_log_imports_without_touching_source(tmp_path) -> No
     records = load_audit_log_records(db_path)
     assert len(records) == 2
     assert [entry['action'] for _, entry in records] == ['advisor_only', 'manual_enact']
+
+
+def test_legacy_jsonl_setting_uses_existing_sqlite_sibling(tmp_path) -> None:
+    jsonl_path = tmp_path / 'audit.jsonl'
+    db_path = tmp_path / 'audit.sqlite3'
+    jsonl_path.write_text('{"legacy": true}\n', encoding='utf-8')
+    AuditStore(db_path).append({
+        'timestamp': '2026-07-22T00:00:00+00:00',
+        'nation': 'Oringrad',
+        'action': 'advisor_only',
+    })
+
+    assert resolve_audit_store_path(jsonl_path) == db_path
+    records = load_audit_log_records(jsonl_path)
+    assert [record['action'] for _, record in records] == ['advisor_only']
+
+
+def test_legacy_jsonl_setting_migrates_when_sqlite_sibling_is_missing(tmp_path) -> None:
+    jsonl_path = tmp_path / 'audit.jsonl'
+    db_path = tmp_path / 'audit.sqlite3'
+    original = (
+        '{"timestamp":"2026-07-22T00:00:00+00:00",'
+        '"nation":"Oringrad","action":"advisor_only"}\n'
+    )
+    jsonl_path.write_text(original, encoding='utf-8')
+
+    assert resolve_audit_store_path(jsonl_path) == db_path
+    assert db_path.exists()
+    assert jsonl_path.read_text(encoding='utf-8') == original
+    records = load_audit_log_records(jsonl_path)
+    assert [record['action'] for _, record in records] == ['advisor_only']
 
 
 def test_save_advise_options_persists_defaults_and_managed_profile(

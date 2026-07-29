@@ -298,6 +298,7 @@ def compact_profile_for_ai(profile: dict[str, Any] | None) -> dict[str, Any] | N
                 summary[field] = compact_prompt_text(value)
 
     for field in (
+        'concerns',
         'top_priorities',
         'secondary_priorities',
         'red_lines',
@@ -438,6 +439,9 @@ Profile summary:
 Binding rules:
 - The user is sovereign.
 - The profile and constitution are binding.
+- Treat concerns as explicit user amendments to the profile.
+- A concern that names the "biggest", "highest", or "primary" focus outranks
+  general priorities unless it conflicts with a red line or the constitution.
 - Do not ignore red lines.
 - Do not invent issue IDs or option IDs.
 - Choose the policy that best satisfies the profile.

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
+from pathlib import Path
 
 import pytest
 from rich.console import Console
@@ -24,6 +26,14 @@ from nsai.profile.storage import (
     load_profile_json,
     write_profile_json,
 )
+
+
+def test_risk_tolerance_step_explains_each_choice_and_safety_scope() -> None:
+    step = next(step for step in profile_builder.STEPS if step.key == 'risk_tolerance')
+
+    assert all(choice in step.help_text for choice in step.choices or [])
+    assert 'uncertain, disruptive, or hard-to-reverse outcomes' in step.help_text
+    assert 'does not bypass enactment safeguards' in step.help_text
 
 
 def sample_profile() -> dict[str, object]:
@@ -84,6 +94,71 @@ def test_profile_answer_parsing() -> None:
             Step('top_priorities', 'Top Priorities', '', kind='csv_policy'),
             'moonbase',
         )
+
+
+def test_enter_submits_single_line_answer_and_advances() -> None:
+    async def exercise() -> None:
+        app = GovernanceProfileApp(enrich_on_save=False)
+
+        async with app.run_test() as pilot:
+            answer_input = app.query_one('#answer_input')
+            answer_input.value = 'Test Nation'
+
+            await pilot.press('enter')
+
+            assert app.answers['nation_name'] == 'Test Nation'
+            assert app.current_step().key == 'profile_name'
+
+    asyncio.run(exercise())
+
+
+def test_successful_save_disables_save_and_enables_finish() -> None:
+    async def exercise() -> None:
+        app = GovernanceProfileApp(enrich_on_save=True)
+        app.index = len(profile_builder.STEPS) - 1
+        save_calls = 0
+
+        def fake_save_profile() -> Path:
+            nonlocal save_calls
+            save_calls += 1
+            return Path('test_nation_governance_profile.json')
+
+        app.save_profile = fake_save_profile
+
+        async with app.run_test() as pilot:
+            app.action_save()
+            await pilot.pause()
+
+            assert save_calls == 1
+            assert app.query_one('#save').disabled is True
+            assert app.query_one('#next').disabled is False
+            assert app.query_one('#next').label.plain == 'Finish →'
+
+            app.action_save()
+            assert save_calls == 1
+
+    asyncio.run(exercise())
+
+
+def test_failed_save_reenables_save_and_keeps_next_disabled() -> None:
+    async def exercise() -> None:
+        app = GovernanceProfileApp(enrich_on_save=True)
+        app.index = len(profile_builder.STEPS) - 1
+
+        def fail_save_profile() -> Path:
+            raise RuntimeError('model unavailable')
+
+        app.save_profile = fail_save_profile
+
+        async with app.run_test() as pilot:
+            app.action_save()
+            await pilot.pause()
+
+            assert app.query_one('#save').disabled is False
+            assert app.query_one('#next').disabled is True
+            assert app.saved_path is None
+
+    asyncio.run(exercise())
 
 
 def test_profile_builder_accepts_textual_dev_flag() -> None:

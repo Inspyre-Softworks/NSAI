@@ -26,6 +26,23 @@ from nsai.nations import normalize_nation_key
 AUDIT_SCHEMA_VERSION = 1
 
 
+def resolve_audit_store_path(path: Path) -> Path:
+    """Map a legacy JSONL setting to its SQLite sibling, migrating once if needed."""
+
+    expanded = path.expanduser()
+    if expanded.suffix.lower() != '.jsonl':
+        return expanded
+
+    db_path = expanded.with_suffix('.sqlite3')
+    if db_path.exists():
+        return db_path
+
+    if expanded.exists():
+        migrate_jsonl_audit_log(expanded, db_path)
+
+    return db_path
+
+
 class AuditStore:
     """SQLite-backed store for advisor audit records."""
 
@@ -145,7 +162,7 @@ def write_audit_log(
         'fallback_issue_selection_used': fallback_issue_selection_used,
     }
 
-    AuditStore(path).append(record)
+    AuditStore(resolve_audit_store_path(path)).append(record)
 
 
 def append_publication_backfill_log(
@@ -168,10 +185,11 @@ def append_publication_backfill_log(
         'publication_results': publication_results,
     }
 
-    AuditStore(path).append(record)
+    AuditStore(resolve_audit_store_path(path)).append(record)
 
 
 def load_audit_log_records(path: Path) -> list[tuple[int, dict[str, Any]]]:
+    path = resolve_audit_store_path(path)
     if not path.exists():
         return []
 
@@ -317,4 +335,4 @@ def pending_publication_entries(
     return pending
 
 
-__all__ = ['AuditStore', 'write_audit_log', 'append_publication_backfill_log', 'load_audit_log_records', 'migrate_jsonl_audit_log', 'audit_issue_action_succeeded', 'publication_source_key', 'posted_publication_keys', 'pending_publication_entries']
+__all__ = ['AuditStore', 'resolve_audit_store_path', 'write_audit_log', 'append_publication_backfill_log', 'load_audit_log_records', 'migrate_jsonl_audit_log', 'audit_issue_action_succeeded', 'publication_source_key', 'posted_publication_keys', 'pending_publication_entries']

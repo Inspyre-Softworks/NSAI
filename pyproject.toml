@@ -1,6 +1,6 @@
 [project]
 name = 'nsai'
-version = '0.2.7'
+version = '0.2.8'
 description = 'NationStates AI profile builder and live advisor.'
 authors = [{ name = 'Taylor B. | Inspyre-Softworks.' }]
 readme = 'README.md'

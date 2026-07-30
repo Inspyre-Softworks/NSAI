@@ -23,6 +23,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Collapsible, Footer, Header, Label, Static
 
 from nsai.advisor.cache import AdviceCache, CachedAdvice, extract_enactment_outcome
+from nsai.advisor.census import census_scale_label
 from nsai.nations import saved_default_nation_config
 
 
@@ -188,7 +189,7 @@ def enactment_outcome_table(cached: CachedAdvice) -> Table:
             expand=True,
             padding=(0, 1),
         )
-        stats.add_column('Stat', style='bold cyan', no_wrap=True)
+        stats.add_column('Stat', style='bold cyan')
         stats.add_column('Score', justify='right')
         stats.add_column('Change', justify='right')
         stats.add_column('% change', justify='right')
@@ -196,7 +197,7 @@ def enactment_outcome_table(cached: CachedAdvice) -> Table:
             attributes = effect.get('attributes') or {}
             values = effect.get('values') or {}
             stats.add_row(
-                str(attributes.get('id') or '?'),
+                census_scale_label(attributes.get('id') or '?'),
                 str(values.get('score') or effect.get('text') or '—'),
                 str(values.get('change') or '—'),
                 str(values.get('pchange') or '—'),
@@ -286,7 +287,7 @@ def cumulative_enactment_effects_table(
         expand=True,
         padding=(0, 1),
     )
-    stats.add_column('Stat', style='bold cyan', no_wrap=True)
+    stats.add_column('Stat', style='bold cyan')
     stats.add_column('Latest score', justify='right')
     stats.add_column('Total change', justify='right')
     stats.add_column('Combined % change', justify='right')
@@ -301,7 +302,7 @@ def cumulative_enactment_effects_table(
             total['percentage_factor'] - Decimal('1')
         ) * Decimal('100')
         stats.add_row(
-            stat_id,
+            census_scale_label(stat_id),
             str(total['latest_score']),
             _decimal_change_text(total['change']),
             _decimal_change_text(combined_percentage, suffix='%'),

@@ -180,7 +180,6 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 .idea/
-*.lock
 *.jsonl
 ns_governor_audit.sqlite3*
 dist/

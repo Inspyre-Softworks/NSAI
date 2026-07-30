@@ -211,6 +211,7 @@ def test_answered_tui_card_renders_stats_instead_of_another_action(tmp_path) -> 
     console.print(enactment_outcome_table(cached))
     output = console.export_text()
     assert 'Answered successfully' in output
+    assert 'Economy (#1)' in output
     assert '99.17' in output
     assert '0.02' in output
     assert '0.020171' in output
@@ -323,6 +324,8 @@ def test_tab_shows_effects_for_all_recent_session_enactments(tmp_path) -> None:
     console = Console(record=True, width=120)
     console.print(cumulative_enactment_effects_table(enactments))
     cumulative_output = console.export_text()
+    assert 'Economy (#1)' in cumulative_output
+    assert 'Political Freedoms (#2)' in cumulative_output
     assert 'Latest score' in cumulative_output
     assert 'Total change' in cumulative_output
     assert 'Combined % change' in cumulative_output

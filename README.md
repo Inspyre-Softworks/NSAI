@@ -226,9 +226,10 @@ Backfill publication drafts from older enacted audit records:
 ```powershell
 poetry run nsai publications backfill --audit-log ns_governor_audit.jsonl
 poetry run nsai publications backfill --audit-log ns_governor_audit.jsonl --execute
+poetry run nsai publications backfill --execute --order newest --limit 10
 ```
 
-The preview form lists enacted recommendations with dispatch/factbook drafts that have not been posted yet. `--execute` creates missing pages and appends publication backfill records to the audit log so successful posts are not duplicated. NationStates may limit how many announcement pages a nation can create in a short period, so NSAI shows a progress bar and waits between posts for the same nation. The default delay is 300 seconds; override it with `--cooldown-seconds SECONDS`. If NationStates still returns a publication cooldown error, NSAI waits and retries according to `--cooldown-retries`.
+The preview form lists enacted recommendations with dispatch/factbook drafts that have not been posted yet. `--execute` creates missing pages and appends publication backfill records to the audit log so successful posts are not duplicated. When using `--limit`, select the oldest pending entries (the default) with `--order oldest` or the most recent with `--order newest`; ordering is applied before the limit. NationStates may limit how many announcement pages a nation can create in a short period, so NSAI shows a progress bar and waits between posts for the same nation. The progress display estimates the full queue time from every remaining per-nation cooldown plus the average active preparation/submission time observed during the current run. Before the first page finishes, it labels the cooldown-only estimate as excluding submission time. The default delay is 300 seconds; override it with `--cooldown-seconds SECONDS`. If NationStates still returns a publication cooldown error, NSAI waits and retries according to `--cooldown-retries`.
 
 Ask the AI to also produce publication-ready dispatch/factbook text:
 

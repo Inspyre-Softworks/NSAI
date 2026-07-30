@@ -17,8 +17,12 @@ from nsai.advisor.audit import AuditStore, load_audit_log_records, migrate_jsonl
 from nsai.advisor.live import (
     NationStatesError,
     NationStatesClient,
+    estimate_publication_queue_seconds,
     extract_token_usage,
+    format_duration,
+    order_pending_publication_entries,
     pending_publication_entries,
+    publication_queue_eta_text,
     publish_backfill_draft_with_retry,
     publish_publication_drafts,
     resolve_publication_category,
@@ -3291,6 +3295,65 @@ def test_backfill_publish_retries_after_cooldown_without_sleep() -> None:
 
     assert fake_ns.calls == 2
     assert result['status'] == 'posted'
+    assert result['duration_seconds'] >= 0
+
+
+def test_publication_queue_eta_includes_every_inter_page_cooldown() -> None:
+    estimate = estimate_publication_queue_seconds(
+        ['oringrad'] * 150,
+        cooldown_seconds=300,
+        average_processing_seconds=2,
+        last_post_attempt_at={},
+        now=1000,
+    )
+
+    assert estimate == 150 * 2 + 149 * 300
+    assert format_duration(estimate) == '12h 30m'
+
+
+def test_publication_queue_eta_counts_remaining_active_cooldown() -> None:
+    estimate = estimate_publication_queue_seconds(
+        ['oringrad', 'oringrad'],
+        cooldown_seconds=300,
+        average_processing_seconds=5,
+        last_post_attempt_at={'oringrad': 900},
+        now=1000,
+    )
+
+    assert estimate == 200 + 5 + 300 + 5
+
+
+def test_publication_queue_eta_is_per_nation_and_labels_missing_sample() -> None:
+    estimate = estimate_publication_queue_seconds(
+        ['oringrad', 'canterwyn', 'oringrad'],
+        cooldown_seconds=300,
+        average_processing_seconds=10,
+        last_post_attempt_at={},
+        now=1000,
+    )
+    label = publication_queue_eta_text(
+        ['oringrad'] * 3,
+        cooldown_seconds=300,
+        processing_durations=[],
+        last_post_attempt_at={},
+        now=1000,
+    )
+
+    assert estimate == 320
+    assert label == 'Queue ETA 10m + submission time'
+
+
+def test_pending_publication_order_can_select_oldest_or_newest_first() -> None:
+    entries = [{'line': 2}, {'line': 7}, {'line': 11}]
+
+    assert [
+        entry['line']
+        for entry in order_pending_publication_entries(entries, order='oldest')
+    ] == [2, 7, 11]
+    assert [
+        entry['line']
+        for entry in order_pending_publication_entries(entries, order='newest')
+    ][:2] == [11, 7]
 
 
 def test_pending_publication_entries_only_includes_enacted_unposted_drafts() -> None:

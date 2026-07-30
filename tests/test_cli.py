@@ -151,6 +151,9 @@ def test_cli_subcommand_help_surfaces_shapes(capsys) -> None:
     assert '--audit-log' in backfill_output
     assert '--cooldown-seconds' in backfill_output
     assert '--cooldown-retries' in backfill_output
+    assert '--order' in backfill_output
+    assert 'oldest' in backfill_output
+    assert 'newest' in backfill_output
 
     with pytest.raises(SystemExit) as exc:
         build_parser().parse_args(['publications', 'migrate-audit-log', '--help'])

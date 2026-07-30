@@ -8,6 +8,7 @@ import re
 import sys
 import time
 import xml.etree.ElementTree as ET
+from math import ceil
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -440,15 +441,105 @@ def iter_pending_publication_drafts(
     return drafts
 
 
-def make_progress(console: Console) -> Progress:
-    return Progress(
+def order_pending_publication_entries(
+    entries: list[dict[str, Any]],
+    *,
+    order: str,
+) -> list[dict[str, Any]]:
+    """Return pending audit entries in explicitly requested age order."""
+    if order == 'oldest':
+        return list(entries)
+    if order == 'newest':
+        return list(reversed(entries))
+    raise ValueError(f'Unsupported publication backfill order: {order}')
+
+
+def make_progress(
+    console: Console,
+    *,
+    show_queue_eta: bool = False,
+) -> Progress:
+    columns = [
         SpinnerColumn(),
         TextColumn('{task.description}'),
         BarColumn(),
         TextColumn('{task.completed:.0f}/{task.total:.0f}'),
         TimeElapsedColumn(),
-        TimeRemainingColumn(),
-        console=console,
+    ]
+    columns.append(
+        TextColumn('{task.fields[queue_eta]}')
+        if show_queue_eta
+        else TimeRemainingColumn()
+    )
+    return Progress(*columns, console=console)
+
+
+def format_duration(seconds: float) -> str:
+    """Format an estimated duration without implying sub-second precision."""
+    remaining = max(0, ceil(seconds))
+    hours, remaining = divmod(remaining, 3600)
+    minutes, seconds = divmod(remaining, 60)
+    parts = []
+    if hours:
+        parts.append(f'{hours}h')
+    if minutes:
+        parts.append(f'{minutes}m')
+    if seconds or not parts:
+        parts.append(f'{seconds}s')
+    return ' '.join(parts)
+
+
+def estimate_publication_queue_seconds(
+    remaining_nations: list[str],
+    *,
+    cooldown_seconds: float,
+    average_processing_seconds: float,
+    last_post_attempt_at: dict[str, float],
+    now: float,
+) -> float:
+    """Estimate a serial queue, including each per-nation cooldown still due."""
+    virtual_now = now
+    virtual_last_attempt = dict(last_post_attempt_at)
+    cooldown_seconds = max(0.0, cooldown_seconds)
+    average_processing_seconds = max(0.0, average_processing_seconds)
+
+    for nation_key in remaining_nations:
+        last_attempt = virtual_last_attempt.get(nation_key)
+        if last_attempt is not None:
+            elapsed = max(0.0, virtual_now - last_attempt)
+            virtual_now += max(0.0, cooldown_seconds - elapsed)
+        virtual_now += average_processing_seconds
+        virtual_last_attempt[nation_key] = virtual_now
+
+    return max(0.0, virtual_now - now)
+
+
+def publication_queue_eta_text(
+    remaining_nations: list[str],
+    *,
+    cooldown_seconds: float,
+    processing_durations: list[float],
+    last_post_attempt_at: dict[str, float],
+    now: float,
+) -> str:
+    """Build progress text from cooldowns and observed active processing time."""
+    average = (
+        sum(processing_durations) / len(processing_durations)
+        if processing_durations
+        else 0.0
+    )
+    estimate = estimate_publication_queue_seconds(
+        remaining_nations,
+        cooldown_seconds=cooldown_seconds,
+        average_processing_seconds=average,
+        last_post_attempt_at=last_post_attempt_at,
+        now=now,
+    )
+    if not processing_durations:
+        return f'Queue ETA {format_duration(estimate)} + submission time'
+    return (
+        f'Queue ETA {format_duration(estimate)} '
+        f'(avg submit {format_duration(average)})'
     )
 
 
@@ -480,15 +571,19 @@ def publish_backfill_draft_with_retry(
     console: Console,
 ) -> dict[str, Any]:
     attempts = 0
+    active_duration = 0.0
 
     while True:
+        attempt_started_at = time.monotonic()
         result = publish_one_publication_draft(
             ns,
             nation=nation,
             kind=kind,
             draft=draft,
         )
+        active_duration += max(0.0, time.monotonic() - attempt_started_at)
         if not publication_cooldown_hit(result) or attempts >= cooldown_retries:
+            result['duration_seconds'] = active_duration
             return result
 
         attempts += 1
@@ -544,6 +639,7 @@ def run_publication_backfill(args: argparse.Namespace) -> None:
     audit_path = Path(args.audit_log).expanduser().resolve()
     records = load_audit_log_records(audit_path)
     pending = pending_publication_entries(records, nation=args.nation)
+    pending = order_pending_publication_entries(pending, order=args.order)
 
     if args.limit is not None:
         pending = pending[:args.limit]
@@ -567,10 +663,27 @@ def run_publication_backfill(args: argparse.Namespace) -> None:
     console = Console()
     clients: dict[str, NationStatesClient] = {}
     last_post_attempt_at: dict[str, float] = {}
+    processing_durations: list[float] = []
     total_pages = sum(pending_publication_count(entry) for entry in pending)
+    remaining_nations = [
+        normalize_nation_key(nation)
+        for entry in pending
+        if (nation := str(entry['record'].get('nation') or '').strip())
+        for _kind, _draft in iter_pending_publication_drafts(entry)
+    ]
 
-    with make_progress(console) as progress:
-        task = progress.add_task('Publication backfill', total=total_pages)
+    with make_progress(console, show_queue_eta=True) as progress:
+        task = progress.add_task(
+            'Publication backfill',
+            total=total_pages,
+            queue_eta=publication_queue_eta_text(
+                remaining_nations,
+                cooldown_seconds=cooldown_seconds,
+                processing_durations=processing_durations,
+                last_post_attempt_at=last_post_attempt_at,
+                now=time.monotonic(),
+            ),
+        )
         for entry in pending:
             record = entry['record']
             nation = str(record.get('nation') or '').strip()
@@ -618,7 +731,22 @@ def run_publication_backfill(args: argparse.Namespace) -> None:
                     console=console,
                 )
                 last_post_attempt_at[nation_key] = time.monotonic()
+                if remaining_nations:
+                    remaining_nations.pop(0)
+                duration = result.get('duration_seconds')
+                if isinstance(duration, (int, float)) and duration >= 0:
+                    processing_durations.append(float(duration))
                 progress.advance(task)
+                progress.update(
+                    task,
+                    queue_eta=publication_queue_eta_text(
+                        remaining_nations,
+                        cooldown_seconds=cooldown_seconds,
+                        processing_durations=processing_durations,
+                        last_post_attempt_at=last_post_attempt_at,
+                        now=time.monotonic(),
+                    ),
+                )
                 print_publication_results([result], console=console)
                 append_publication_backfill_log(
                     audit_path,
@@ -627,7 +755,11 @@ def run_publication_backfill(args: argparse.Namespace) -> None:
                     publication_results=[result],
                 )
 
-        progress.update(task, description='Publication backfill complete')
+        progress.update(
+            task,
+            description='Publication backfill complete',
+            queue_eta='Queue ETA 0s',
+        )
 
 
 def resolve_nation_name(
@@ -1011,7 +1143,16 @@ def add_publications_arguments(subparsers: argparse._SubParsersAction) -> None:
         '--limit',
         type=int,
         default=None,
-        help='Only process the first N pending audit entries.',
+        help='Only process the first N pending audit entries after --order is applied.',
+    )
+    backfill_parser.add_argument(
+        '--order',
+        choices=('oldest', 'newest'),
+        default='oldest',
+        help=(
+            'Choose which pending entries are processed first. '
+            'Defaults to oldest.'
+        ),
     )
     backfill_parser.add_argument(
         '--cooldown-seconds',
@@ -1826,6 +1967,10 @@ __all__ = [
     'save_advise_options',
     'publish_publication_drafts',
     'publish_backfill_draft_with_retry',
+    'estimate_publication_queue_seconds',
+    'format_duration',
+    'order_pending_publication_entries',
+    'publication_queue_eta_text',
     'resolve_publication_category',
     'extract_token_usage',
 ]
